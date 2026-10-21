@@ -1,0 +1,19 @@
+:root { color-scheme: light; font-family: system-ui, -apple-system, sans-serif; background: #f4f7fb; color: #142139; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+main { max-width: 1120px; margin: 0 auto; padding: 40px 24px 80px; }
+h1 { font-size: 2.5rem; margin: 0 0 8px; }
+h2 { font-size: 1.35rem; margin-top: 0; }
+p { line-height: 1.6; }
+.card { background: white; border: 1px solid #e0e7ef; border-radius: 15px; padding: 22px; margin: 20px 0; box-shadow: 0 5px 20px #12345608; }
+input, select, button, textarea { font: inherit; border-radius: 8px; padding: 10px; }
+input, select, textarea { border: 1px solid #c5cfda; background: white; max-width: 100%; }
+button { background: #154f91; border: none; color: white; cursor: pointer; }
+button:disabled { opacity: .5; cursor: not-allowed; }
+.row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+.stack { display: grid; gap: 12px; }
+.badge { display: inline-block; background: #e8f2ff; color: #154f91; padding: 5px 10px; border-radius: 30px; }
+small, .muted { color: #556477; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #f5f7fa; padding: 12px; border-radius: 8px; }
+.error { color: #9b2222; }
+.result { border-top: 1px solid #e6e6e6; padding-top: 12px; margin-top: 12px; }
