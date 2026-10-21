@@ -126,3 +126,23 @@ class ScientificRelation(Base):
     reviewed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class RelationModelRun(Base):
+    """Runs separados do extrator de entidades (schema aditivo)."""
+    __tablename__ = "relation_model_runs"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
+    artifact_dir: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metrics_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class RelationNegativeAssessment(Base):
+    """Decisão explícita: relação ausente; rejeição genérica NÃO é negativo."""
+    __tablename__ = "relation_negative_assessments"
+    relation_id: Mapped[str] = mapped_column(ForeignKey("scientific_relations.id"), primary_key=True)
+    assessed_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    reason: Mapped[str] = mapped_column(String(32), nullable=False, default="relation_absent")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)

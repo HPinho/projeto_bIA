@@ -88,3 +88,15 @@ O grafo de relações é **curado**, não gerado automaticamente por IA. O paine
 Reabrir ou recertificar um trecho invalida, para consulta, relações de certificações anteriores. Nenhuma relação é aprendida ou publicada automaticamente: o Transformer próprio existente extrai **entidades experimentais**, não relações.
 
 Veja [protocolo, limitações e próxima etapa](docs/BLOCO_02_1_RELACOES.md). **Próximo item: BIA-02.2 — protocolo de negativos explícitos e treinamento de um classificador de relações com pesos próprios**, após definição das regras científicas pelos INCTs.
+
+## Bloco 02.2 — Treinamento neural próprio de relações (experimental)
+
+O novo classificador `bia_core/relation_learning.py` usa um Transformer próprio inicializado **do zero** (PyTorch apenas como infraestrutura de tensores e treinamento). Distingue relações **aprovadas** (positivas) das relações **rejeitadas com declaração explícita de ausência** (negativas). Uma rejeição simples **não** é um negativo de treinamento.
+
+1. Após revisão independente, marque a rejeição como ausência científica apenas quando for justificável: `POST /v1/relations/{id}/review` com `{"decision":"rejected","explicit_no_relation":true}`. Aprovações usam `{"decision":"approved"}`; rejeições genéricas `{"decision":"rejected"}`.
+2. Um administrador pode iniciar `POST /v1/relation-models/train` com `{"epochs":2,"seed":42}`; consulte `GET /v1/relation-models/runs/{id}`. O trabalho é executado localmente sem API externa.
+3. Curadores podem solicitar `GET /v1/passages/{id}/relation-predictions` para obter candidatos ordenados com **escores não calibrados**. Essas sugestões nunca são publicadas automaticamente como relações científicas.
+
+A avaliação preserva a divisão por documento e agrupa textos iguais entre estudos para prevenir vazamento óbvio de dados. Não há números de desempenho científico alegados enquanto não tivermos um corpus anotado e validado por especialistas. [Leia o protocolo completo BIA-02.2](docs/BLOCO_02_2_APRENDIZADO_RELACOES.md).
+
+**Próxima frente:** BIA-02.3 — dataset tripartite de relações e avaliação independente por estudo, com calibração e análise de erros.

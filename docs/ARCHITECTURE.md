@@ -42,3 +42,7 @@ Bloco 02: extração supervisionada de relações material–processo–condiç�
 ### Bloco 02.1: grafo curado de relações (rodada 03)
 
 Relações direcionais usam duas entidades aprovadas no mesmo trecho, offsets literais de evidência e um identificador criptográfico da **versão de certificação**. Sugestões heurísticas são apresentadas como hipóteses, não como resultados do modelo. A consulta é restrita a relações aprovadas por revisor independente, certificação vigente e direitos de acesso compatíveis. A reabertura do trecho invalida o grafo derivado sem apagar o registro auditável. A próxima frente BIA-02.2 trata de treinamento de relações com dados explicitamente validados, não de treinar em negativas presumidas. Consulte `docs/BLOCO_02_1_RELACOES.md`.
+
+### BIA-02.2 — Módulo de aprendizado de relações
+
+`bia_core/relation_learning.py` adiciona classificador char-Transformer próprio, com pesos locais, entradas de offsets de sujeito/objeto e tipo do predicado. `RelationNegativeAssessment` guarda negativos **expressamente** confirmados como ausentes (rejeição genérica não vale como negativo). `RelationModelRun` isola jobs e artefatos do extrator NER. Predições são apenas hipóteses; não são importadas ao grafo verificado. Veja [protocolo BIA-02.2](BLOCO_02_2_APRENDIZADO_RELACOES.md). Próxima implementação: **BIA-02.3 — avaliação e versionamento de datasets científicos**.

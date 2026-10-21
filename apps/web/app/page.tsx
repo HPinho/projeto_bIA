@@ -7,6 +7,7 @@ type ReviewState = { status: string; submitted_by: string | null; certified_by: 
 type Passage = { id: string; page: number; text: string; review: ReviewState };
 type Annotation = { id: string; label: string; start: number; end: number; quote: string; status: string };
 type CandidateRelation = { subject_annotation_id: string; object_annotation_id: string; relation_type: string; evidence_start: number; evidence_end: number; evidence_quote: string; status: string };
+type PredictedRelation = CandidateRelation & { model_score_uncalibrated: number; scientifically_validated: false };
 type CuratedRelation = { id: string; relation_type: string; status: string; verified: boolean; certification_current: boolean; evidence_quote: string; proposed_by: string; reviewed_by: string | null };
 type VerifiedRelation = { id: string; title: string; doi: string | null; page: number; relation_type: string; subject: { quote: string }; object: { quote: string }; evidence: { quote: string }; review: { proposed_by: string; reviewed_by: string } };
 
@@ -21,6 +22,9 @@ export default function Research() {
   const [message, setMessage] = useState('');
   const [modelOutput, setModelOutput] = useState('');
   const [candidates, setCandidates] = useState<CandidateRelation[]>([]);
+  const [predictions, setPredictions] = useState<PredictedRelation[]>([]);
+  const [relationRunId, setRelationRunId] = useState('');
+  const [relationRunStatus, setRelationRunStatus] = useState('');
   const [curatedRelations, setCuratedRelations] = useState<CuratedRelation[]>([]);
   const [relationResults, setRelationResults] = useState<VerifiedRelation[]>([]);
   const [relationQuery, setRelationQuery] = useState('celulose');
@@ -54,14 +58,14 @@ export default function Research() {
     await exec(async () => {
       const result: Passage[] = await api(`/v1/documents/${documentId}/passages`);
       setPassages(result); setSelected(result[0]?.id || '');
-      setCandidates([]); setCuratedRelations([]); setModelOutput('');
+      setCandidates([]); setCuratedRelations([]); setPredictions([]); setModelOutput('');
       if (result[0]) { setAnnotations(await api('/v1/annotations/' + result[0].id)); setReviewState(result[0].review); }
       else { setAnnotations([]); setReviewState(null); }
     });
   }
   async function choosePassage(id: string) {
     await exec(async () => {
-      setSelected(id); setCandidates([]); setCuratedRelations([]); setModelOutput('');
+      setSelected(id); setCandidates([]); setCuratedRelations([]); setPredictions([]); setModelOutput('');
       setAnnotations(await api('/v1/annotations/' + id));
       setReviewState(await api('/v1/passages/' + id + '/review'));
     });
@@ -69,7 +73,7 @@ export default function Research() {
   async function changeReview(action: 'submit' | 'certify' | 'reopen') {
     await exec(async () => {
       setReviewState(await api(`/v1/passages/${selected}/${action}`, { method: 'POST' }));
-      setCandidates([]); setCuratedRelations([]);
+      setCandidates([]); setCuratedRelations([]); setPredictions([]);
       setMessage(`Trecho: ${action} concluído. Atualize o estado antes de treinar.`);
     });
   }
@@ -120,13 +124,37 @@ export default function Research() {
       setMessage('Relação proposta. Outro curador precisa revisar a evidência original.');
     });
   }
-  async function reviewRelation(relationId: string, decision: 'approved' | 'rejected') {
+  async function reviewRelation(relationId: string, decision: 'approved' | 'rejected', explicitNoRelation = false) {
     await exec(async () => {
       await api(`/v1/relations/${relationId}/review`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ decision }) });
+        body: JSON.stringify({ decision, explicit_no_relation: explicitNoRelation }) });
       const existing = await api(`/v1/passages/${selected}/relations`);
       setCuratedRelations(existing.relations);
       setMessage('Revisão registrada. Apenas relações aprovadas com certificação vigente são consultáveis.');
+    });
+  }
+  async function trainRelationModel() {
+    await exec(async () => {
+      const run = await api('/v1/relation-models/train', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ epochs: 2, seed: 42 }) });
+      setRelationRunId(run.id); setRelationRunStatus(run.status);
+      setMessage('Treinamento local solicitado. Somente administrador pode iniciar. Consulte o status.');
+    });
+  }
+  async function relationTrainingStatus() {
+    await exec(async () => {
+      if (!relationRunId) throw Error('Informe o identificador do treinamento.');
+      const run = await api('/v1/relation-models/runs/' + encodeURIComponent(relationRunId));
+      setRelationRunStatus(run.status);
+      setMessage(JSON.stringify({ status: run.status, metrics: run.metrics, error: run.error }, null, 2));
+    });
+  }
+  async function predictRelations() {
+    await exec(async () => {
+      const query = relationRunId ? `?run_id=${encodeURIComponent(relationRunId)}` : '';
+      const response = await api(`/v1/passages/${selected}/relation-predictions${query}`);
+      setPredictions(response.candidates);
+      setMessage(response.warning || response.reason || 'Previsões experimentais não verificadas.');
     });
   }
   async function searchRelations(e: FormEvent) {
@@ -138,7 +166,7 @@ export default function Research() {
     });
   }
   return <main>
-    <header><span className="badge">Bloco 02.1 · Relações científicas experimentais</span><h1>bIA</h1><p className="muted">Inteligência de materiais com fontes verificáveis · modelo próprio · processamento local</p></header>
+    <header><span className="badge">Bloco 02.2 · Relações científicas com IA local</span><h1>bIA</h1><p className="muted">Inteligência de materiais com fontes verificáveis · modelo próprio · processamento local</p></header>
     <section className="card stack"><h2>Conexão com o laboratório</h2><label>Token de acesso (somente memória desta aba)</label><input type="password" value={token} autoComplete="off" onChange={e => setToken(e.target.value)} placeholder="Bearer token configurado na API" /><small>Use tokens diferentes para criar e revisar anotações. Não utilize este protótipo publicamente sem autenticação institucional.</small></section>
     <section className="card"><h2>Importar documento científico autorizado</h2><form className="stack" onSubmit={upload}>
       <input required placeholder="Título do trabalho" value={title} onChange={e => setTitle(e.target.value)} />
@@ -171,8 +199,21 @@ export default function Research() {
         {curatedRelations.map(r => <article className="result" key={r.id}>
           <strong>{r.relation_type}</strong> · <span>{r.status}</span> · {r.verified ? 'revisada e vigente' : r.certification_current ? 'não publicada' : 'certificação obsoleta'}
           <p>{r.evidence_quote}</p><small>Proponente: {r.proposed_by} · Revisor: {r.reviewed_by || 'pendente'}</small>
-          {r.status === 'pending' && r.certification_current && <div className="row"><button type="button" onClick={() => reviewRelation(r.id, 'approved')}>Aprovar relação</button><button type="button" onClick={() => reviewRelation(r.id, 'rejected')}>Rejeitar relação</button></div>}
+          {r.status === 'pending' && r.certification_current && <div className="row"><button type="button" onClick={() => reviewRelation(r.id, 'approved')}>Aprovar relação</button><button type="button" onClick={() => reviewRelation(r.id, 'rejected')}>Rejeitar (sem exemplo negativo)</button><button type="button" onClick={() => reviewRelation(r.id, 'rejected', true)}>Confirmar ausência da relação (negativo para treino)</button></div>}
         </article>)}
+        <div className="stack"><h3>Modelo neural de relações (experimental)</h3>
+          <p className="muted">Treinado apenas com revisões atuais autorizadas, positivos aprovados e negativos de ausência declarada. Escores não são probabilidades calibradas e jamais aprovam relações automaticamente.</p>
+          <div className="row"><button type="button" onClick={trainRelationModel}>Treinar modelo local (admin)</button>
+            <input value={relationRunId} placeholder="ID do treinamento (opcional)" onChange={e => setRelationRunId(e.target.value)} />
+            <button type="button" onClick={relationTrainingStatus}>Consultar treino</button>
+            <button type="button" disabled={reviewState?.status !== 'certified'} onClick={predictRelations}>Ordenar sugestões com IA</button></div>
+          {relationRunStatus && <p className="muted">Execução: {relationRunStatus}</p>}
+          {predictions.map((r, idx) => <article className="result" key={`${r.relation_type}-${idx}`}>
+            <strong>{r.relation_type}</strong> · escore não calibrado: {r.model_score_uncalibrated.toFixed(3)}
+            <p>{r.evidence_quote}</p><small>Não verificada · requer revisão humana</small>
+            <button type="button" onClick={() => propose(r)}>Propor para revisão</button>
+          </article>)}
+        </div>
       </section>
       <button onClick={() => exec(async () => { const r = await api('/v1/extract/' + selected); setModelOutput(JSON.stringify(r, null, 2)); })}>Extrair com o modelo local</button>{modelOutput && <pre>{modelOutput}</pre>}
     </section>}

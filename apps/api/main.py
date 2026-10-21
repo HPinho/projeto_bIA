@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from bia_core.db import Annotation, AuditEvent, Document, Passage, PassageReview, ScientificRelation, TrainingRun, make_session_factory, now
+from bia_core.db import Annotation, AuditEvent, Document, Passage, PassageReview, ScientificRelation, TrainingRun, RelationModelRun, RelationNegativeAssessment, make_session_factory, now
 from bia_core.ingestion import InvalidPDF, pages_from_pdf
 from bia_core.curation import annotations_for, review_state
 from bia_core.model import ENTITY_LABELS
@@ -23,6 +23,7 @@ from bia_core.retrieval import bm25
 from bia_core.relations import (MAX_EVIDENCE_CHARS, RELATION_SIGNATURES, candidate_pairs,
                                 certified_anchors, is_current, relation_record)
 from bia_core.training import extract, train
+from bia_core.relation_learning import train_relations, predict_candidates
 
 ROLES = ("viewer", "researcher", "curator", "admin")
 ALLOWED_RIGHTS = ("open_access", "author_permission", "institutional_permission")
@@ -37,6 +38,11 @@ class NewAnnotation(BaseModel):
 
 class ReviewDecision(BaseModel):
     decision: Literal["approved", "rejected"]
+
+
+class RelationReviewDecision(BaseModel):
+    decision: Literal["approved", "rejected"]
+    explicit_no_relation: bool = False
 
 
 class RelationProposal(BaseModel):
@@ -376,7 +382,7 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
                 "evidence_quote": passage.text[rel.evidence_start:rel.evidence_end]}
 
     @app.post("/v1/relations/{relation_id}/review")
-    def review_relation(relation_id: str, data: ReviewDecision,
+    def review_relation(relation_id: str, data: RelationReviewDecision,
                         user: dict = Depends(role("curator", "admin")), session: Session = Depends(db)):
         rel = session.get(ScientificRelation, relation_id)
         if rel is None:
@@ -391,9 +397,14 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
         if key != rel.certification_key or not key or (approved.get(rel.subject_annotation_id) is None
             or approved.get(rel.object_annotation_id) is None):
             raise HTTPException(409, "Certificação alterada; relação obsoleta")
+        if data.explicit_no_relation and data.decision != "rejected":
+            raise HTTPException(422, "Negativo explícito exige rejeição da relação")
         rel.status = data.decision
         rel.reviewed_by = user["actor"]
         rel.reviewed_at = now()
+        if data.explicit_no_relation:
+            session.add(RelationNegativeAssessment(relation_id=rel.id,
+                assessed_by=user["actor"], reason="relation_absent"))
         audit(session, user, "relation.review." + data.decision, rel.id)
         session.commit()
         return {"id": rel.id, "status": rel.status, "verified": is_current(session, rel)}
@@ -448,6 +459,80 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
         return {"status": "ok" if verified else "insufficient_evidence", "scientifically_validated": False,
                 "scope": "human_reviewed_relations_not_externally_validated",
                 "results": verified[:limit]}
+
+    def run_relation_training(run_id: str, epochs: int, seed: int):
+        with job_lock, session_factory() as session:
+            job = session.get(RelationModelRun, run_id)
+            job.status = "running"
+            session.commit()
+            try:
+                metrics = train_relations(session, root / "relations" / run_id, epochs=epochs, seed=seed)
+                job.status = "completed"
+                job.artifact_dir = str(root / "relations" / run_id)
+                job.metrics_json = json.dumps(metrics)
+            except Exception as exc:
+                job.status = "failed"
+                job.error = str(exc)[:1000]
+            session.commit()
+
+    @app.post("/v1/relation-models/train", status_code=202)
+    def start_relation_training(data: TrainRequest, user: dict = Depends(role("admin",)),
+                                session: Session = Depends(db)):
+        job = RelationModelRun(status="queued")
+        session.add(job)
+        session.flush()
+        audit(session, user, "relation_model.training.start", job.id)
+        session.commit()
+        executor.submit(run_relation_training, job.id, data.epochs, data.seed)
+        return {"id": job.id, "status": job.status}
+
+    @app.get("/v1/relation-models/runs/{run_id}")
+    def relation_model_status(run_id: str, user: dict = Depends(role("curator", "admin")),
+                              session: Session = Depends(db)):
+        run = session.get(RelationModelRun, run_id)
+        if run is None:
+            raise HTTPException(404, "Treinamento de relações não encontrado")
+        return {"id": run.id, "status": run.status,
+                "metrics": json.loads(run.metrics_json) if run.metrics_json else None,
+                "error": run.error}
+
+    @app.get("/v1/passages/{passage_id}/relation-predictions")
+    def relation_predictions(passage_id: str, run_id: str | None = None,
+                             user: dict = Depends(role("curator", "admin")),
+                             session: Session = Depends(db)):
+        passage = session.get(Passage, passage_id)
+        if passage is None:
+            raise HTTPException(404, "Trecho não encontrado")
+        document = get_doc(session, passage.document_id, user)
+        if run_id is not None:
+            run = session.get(RelationModelRun, run_id)
+        else:
+            run = session.scalar(select(RelationModelRun).where(RelationModelRun.status == "completed")
+                .order_by(RelationModelRun.created_at.desc(), RelationModelRun.id.desc()))
+        base = {"passage_id": passage_id, "document_id": document.id, "page": passage.page,
+                "doi": document.doi, "scientifically_validated": False}
+        if run is None or run.status != "completed" or not run.artifact_dir:
+            return {**base, "status": "insufficient_evidence", "reason": "no_trained_relation_model",
+                    "candidates": []}
+        raw = candidate_pairs(session, passage_id)
+        if not raw:
+            return {**base, "status": "insufficient_evidence", "reason": "no_certified_pairs",
+                    "model_run_id": run.id, "candidates": []}
+        _, anchors = certified_anchors(session, passage_id)
+        if len(raw) > 100:
+            raise HTTPException(422, "Muitas relações candidatas: refine a anotação; nenhuma sugestão foi omitida")
+        enriched = []
+        for candidate in raw:
+            subj = anchors[candidate["subject_annotation_id"]]
+            dest = anchors[candidate["object_annotation_id"]]
+            enriched.append({**candidate, "subject": (subj.start, subj.end), "object": (dest.start, dest.end)})
+        try:
+            ranked = predict_candidates(passage, enriched, Path(run.artifact_dir))
+        except (ValueError, OSError, KeyError) as exc:
+            raise HTTPException(409, "Modelo de relações indisponível ou incompatível") from exc
+        return {**base, "status": "experimental_unverified", "model_run_id": run.id,
+                "warning": "Escore não calibrado: nenhuma relação é aprovada automaticamente",
+                "candidates": ranked}
 
     def run_training(run_id: str, epochs: int, seed: int):
         with job_lock, session_factory() as session:
