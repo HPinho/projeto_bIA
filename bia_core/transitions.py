@@ -20,8 +20,11 @@ def submit_once(session, passage_id: str, actor: str) -> bool:
         raise RuntimeError('Transições condicionais não homologadas para este banco')
     created = session.execute(stmt.values(
         passage_id=passage_id, status='submitted', submitted_by=actor,
-        submitted_at=now()).on_conflict_do_nothing(index_elements=['passage_id']))
-    if created.rowcount == 1:
+        submitted_at=now()).on_conflict_do_nothing(index_elements=['passage_id'])
+        .returning(PassageReview.passage_id)).scalar_one_or_none()
+    # An ORM INSERT with RETURNING can expose rowcount=-1 on psycopg; the
+    # actual returned PK, not rowcount, is the reliable insert outcome.
+    if created is not None:
         session.expire_all()
         return True
     result = session.execute(update(PassageReview).where(

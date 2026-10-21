@@ -16,7 +16,7 @@ Parte da baseline verde `8c3394c`. Consolida as verificações antigas e adicion
 
 ## Concorrência e curadoria
 
-`submit_once`, `certify_once` e `reopen_once` executam `INSERT ON CONFLICT DO NOTHING` ou `UPDATE ... WHERE status = ...`, usando **linhas efetivamente alteradas** para distinguir a operação vencedora da operação obsoleta. A API transforma chamadas perdedoras em HTTP 409. Não se registra segundo evento de certificação para um mesmo estado.
+`submit_once`, `certify_once` e `reopen_once` executam `INSERT ON CONFLICT DO NOTHING RETURNING passage_id` ou `UPDATE ... WHERE status = ...`, usando **o identificador retornado na inserção** (e linhas alteradas nos UPDATEs) para distinguir a operação vencedora da obsoleta, independentemente do `rowcount` informado pelo psycopg. A API transforma chamadas perdedoras em HTTP 409. Não se registra segundo evento de certificação para um mesmo estado.
 
 No PostgreSQL, anotações, revisão, submissão, certificação e reabertura obtêm `FOR UPDATE` na linha do trecho para sincronizar alterações com as transições. O teste PostgreSQL executa duas requisições de submissão a partir de **processos do sistema operacional distintos**, exige exatamente um HTTP 200, um 409, um estado coerente e apenas um evento de auditoria. O job ainda prova a imutabilidade do snapshot por trigger PostgreSQL.
 

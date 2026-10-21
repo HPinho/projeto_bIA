@@ -74,8 +74,8 @@ def test_postgres_cas_across_processes_and_retention(tmp_path):
             proc.terminate()
             proc.join(timeout=5)
         assert proc.exitcode == 0, f'process crashed {proc.exitcode}'
-    results = sorted([queue.get(timeout=5)[0] for _ in range(2)])
-    assert results == [200, 409], results
+    responses = [queue.get(timeout=5) for _ in range(2)]
+    assert sorted(code for code, _ in responses) == [200, 409], responses
     with factory() as session:
         assert session.get(PassageReview, pid).status == 'submitted'
         assert len(session.scalars(select(AuditEvent).where(
