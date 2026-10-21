@@ -12,8 +12,8 @@ from bia_core.db import Annotation, Passage, ScientificRelation, make_session_fa
 from bia_core.relations import RELATION_SIGNATURES, candidate_pairs
 
 KEYS = {
-    "author": {"actor": "autor", "role": "curator"},
-    "peer": {"actor": "revisor", "role": "curator"},
+    "author": {"actor": "autor", "role": "curator", "institutes": ["inovaligno"]},
+    "peer": {"actor": "revisor", "role": "curator", "institutes": ["inovaligno"]},
     "other": {"actor": "avaliador", "role": "admin"},
     "viewer": {"actor": "leitor", "role": "viewer"},
 }
@@ -41,7 +41,8 @@ def fx(tmp_path):
 def document(client, text="Celulose submetida a prensagem apresentou rigidez de 30 MPa", rights="open_access"):
     res = client.post("/v1/documents", headers=auth("author"),
         files={"file": ("example.pdf", pdf(text), "application/pdf")},
-        data={"title": "Dado sintético", "doi": "10.1234/example", "rights_basis": rights, "training_allowed": "false"})
+        data={"title": "Dado sintético", "doi": "10.1234/example", "rights_basis": rights, "training_allowed": "false",
+              **({"institute": "inovaligno"} if rights == "institutional_permission" else {})})
     assert res.status_code == 201, res.text
     p = client.get(f"/v1/documents/{res.json()['id']}/passages", headers=auth("author")).json()[0]
     return p

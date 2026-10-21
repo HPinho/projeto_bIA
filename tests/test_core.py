@@ -17,8 +17,8 @@ from bia_core.model import LABELS
 
 
 KEYS = {
-    "editor-secret": {"actor": "editor", "role": "curator"},
-    "reviewer-secret": {"actor": "reviewer", "role": "curator"},
+    "editor-secret": {"actor": "editor", "role": "curator", "institutes": ["inovaligno"]},
+    "reviewer-secret": {"actor": "reviewer", "role": "curator", "institutes": ["inovaligno"]},
     "admin-secret": {"actor": "admin", "role": "admin"},
     "viewer-secret": {"actor": "reader", "role": "viewer"},
 }
@@ -46,7 +46,8 @@ def env(tmp_path):
 def add_pdf(client, *, key="editor-secret", text="Celulose possui resistencia de 45 MPa", rights="open_access", training="true"):
     return client.post("/v1/documents", headers=bearer(key),
                        files={"file": ("artigo.pdf", pdf(text), "application/pdf")},
-                       data={"title": "Artigo de demonstração", "rights_basis": rights, "training_allowed": training})
+                       data={"title": "Artigo de demonstração", "rights_basis": rights, "training_allowed": training,
+                             **({"institute": "inovaligno"} if rights == "institutional_permission" else {})})
 
 
 def test_tokenizer_round_trip_unicode():

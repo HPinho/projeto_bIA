@@ -2,7 +2,7 @@
 
 Núcleo experimental da **bIA**, desenvolvido com código próprio de busca, tokenização, arquitetura neural, treinamento e inferência local, **sem APIs de IA comerciais, checkpoints pré-treinados ou download automático de pesos**.
 
-> **Estado:** Bloco 01 (protótipo de pesquisa). A IA ainda não foi validada cientificamente. A proposta dos INCTs define construção do acervo, extração e validação tripartite antes de adoção científica.
+> **Estado:** BIA-02.8 (protótipo de pesquisa). A IA ainda não foi validada cientificamente. A proposta dos INCTs define construção do acervo, extração e validação tripartite antes de adoção científica.
 
 ## Executar localmente
 
@@ -22,7 +22,7 @@ No Windows/PowerShell, use `Copy-Item .env.example .env` e configure as variáve
 Exemplo rápido de configuração em Bash para desenvolvimento local:
 
 ```bash
-export BIA_API_KEYS='{"dev-curator-CHANGE":{"actor":"curator","role":"curator"},"dev-reviewer-CHANGE":{"actor":"reviewer","role":"curator"},"dev-admin-CHANGE":{"actor":"admin","role":"admin"}}'
+export BIA_API_KEYS='{"dev-curator-CHANGE":{"actor":"curator","role":"curator","institutes":["inovaligno"]},"dev-reviewer-CHANGE":{"actor":"reviewer","role":"curator","institutes":["inovaligno"]},"dev-admin-CHANGE":{"actor":"admin","role":"admin"}}'
 export BIA_DATABASE_URL='sqlite:///./data/bia.sqlite3'
 export BIA_STORAGE_DIR='./data/documents'
 ```
@@ -155,3 +155,39 @@ Administradores podem consultar `/v1/corpus/readiness` (contagens agregadas), `/
 O GitHub Actions executa também um job real **PostgreSQL 16** com duas requisições concorrentes em processos separados. Use `pip install -e '.[test,postgres]'` para esse teste e `BIA_TEST_POSTGRES_URL` para apontar um banco descartável. Sem essa variável, os testes PostgreSQL são pulados localmente.
 
 Detalhes, limites e instruções de migração: [docs/BLOCO_02_7_TRANSACOES_RETENCAO.md](docs/BLOCO_02_7_TRANSACOES_RETENCAO.md). Próximo item **BIA-02.8 — isolamento institucional, autenticação e corpus validado**.
+
+## BIA-02.8 — acesso por instituto e autenticação do protótipo
+
+Documentos com `rights_basis=institutional_permission` **exigem** `institute`
+(`inovaligno`, `polissacarideos` ou `circularidade`) na importação. Somente um
+curador com afiliação correspondente, ou administrador global, pode importá-los.
+Leituras de documentos institucionais são limitadas ao instituto, também na
+busca, nas relações, nas duplicatas e no resumo de curadoria. O perfil do token
+não é escolhido pela requisição: é associado à credencial no servidor.
+
+- `GET /v1/auth/me` verifica qual identidade, papel e institutos a API reconhece.
+- `PUT /v1/documents/{id}/institution` permite ao administrador **classificar**
+  documentos institucionais legados sem afiliação; exige justificativa e não
+  permite troca silenciosa entre institutos.
+- `GET /v1/audit/events` permite ao administrador consultar registros de
+  alterações e leituras institucionais. Tokens não entram na auditoria.
+- Migração `0004` acrescenta `documents.institute` de modo aditivo. Documentos
+  antigos com `institutional_permission` e `institute=NULL` ficam **bloqueados
+  para não administradores** até revisão e classificação humanas. Faça backup
+  antes de aplicar migrações e revise o acervo após o upgrade.
+- Segredos fornecidos em `BIA_API_KEYS` são comparados por SHA-256 e comparação
+  de tempo constante, mas **ainda são chaves locais estáticas**: não há
+  provisionamento de identidades federadas, SSO/OIDC, MFA, refresh/revogação
+  centralizada nem controle por linha no PostgreSQL. **Não expor a API
+  publicamente**. Exigir TLS, gestão de segredos e controles institucionais de
+  produção antes de implantação real.
+
+O treinamento permanece uma tarefa de **administrador global** sobre corpus
+explicitamente autorizado. Esse protótipo ainda não implementa segregação de
+checkpoints/modelos por instituto; conjuntos com dados compartilháveis entre
+institutos exigem autorização contratual e validação do comitê responsável.
+Consulte [`docs/BLOCO_02_8_ACESSO_INSTITUCIONAL.md`](docs/BLOCO_02_8_ACESSO_INSTITUCIONAL.md).
+
+**Próximo bloco previsto: BIA-02.9** — credenciais com rotação e revogação,
+políticas de compartilhamento do corpus, escopo de treinamento por instituto,
+SSO/OIDC e verificação externa de segurança.

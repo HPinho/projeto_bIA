@@ -54,6 +54,8 @@ export default function Research() {
   const [end, setEnd] = useState(1);
   const [title, setTitle] = useState('');
   const [rights, setRights] = useState('open_access');
+  const [institute, setInstitute] = useState('');
+  const [identity, setIdentity] = useState<{actor: string; role: string; institutes: string[]} | null>(null);
   const [trainingAllowed, setTrainingAllowed] = useState(false);
   const [file, setFile] = useState<File | null>(null);
   async function api(path: string, init: RequestInit = {}) {
@@ -113,6 +115,7 @@ export default function Research() {
       const data = new FormData();
       data.append('file', file); data.append('title', title);
       data.append('rights_basis', rights); data.append('training_allowed', String(trainingAllowed));
+      if (rights === 'institutional_permission') data.append('institute', institute);
       const result = await api('/v1/documents', { method: 'POST', body: data });
       setMessage(`Documento ${result.id} registrado (${result.status}).`);
       await loadPassages(result.id);
@@ -287,8 +290,11 @@ export default function Research() {
     });
   }
   return <main>
-    <header><span className="badge">Bloco 02.5 · Concordância científica e datasets auditáveis</span><h1>bIA</h1><p className="muted">Inteligência de materiais com fontes verificáveis · modelo próprio · processamento local</p></header>
-    <section className="card stack"><h2>Conexão com o laboratório</h2><label>Token de acesso (somente memória desta aba)</label><input type="password" value={token} autoComplete="off" onChange={e => setToken(e.target.value)} placeholder="Bearer token configurado na API" /><small>Use tokens diferentes para criar e revisar anotações. Não utilize este protótipo publicamente sem autenticação institucional.</small></section>
+    <header><span className="badge">Bloco 02.8 · Isolamento institucional e autenticação local</span><h1>bIA</h1><p className="muted">Inteligência de materiais com fontes verificáveis · modelo próprio · processamento local</p></header>
+    <section className="card stack"><h2>Conexão com o laboratório</h2><label>Token de acesso (somente memória desta aba)</label><input type="password" value={token} autoComplete="off" onChange={e => { setToken(e.target.value); setIdentity(null); }} placeholder="Bearer token configurado na API" />
+      <button type="button" disabled={!token} onClick={() => exec(async () => { setIdentity(await api('/v1/auth/me')); })}>Verificar identidade e institutos</button>
+      {identity && <p className="muted">Identidade: {identity.actor} · papel: {identity.role} · institutos: {identity.institutes.join(', ') || 'nenhum autorizado'}</p>}
+      <small>Credenciais locais de protótipo, não SSO. Curadores só consultam documentos restritos dos institutos autorizados; mudança de afiliação requer administrador. Utilize HTTPS antes de uso em rede.</small></section>
     <section className="card stack"><h2>Inventário científico e governança · BIA-02.7</h2>
       <p className="muted">Visão administrativa restrita: fontes, autorização de treinamento e revisão de retenção. Não é uma certificação científica nem autoriza exclusões automáticas.</p>
       <button type="button" disabled={!token} onClick={loadCorpus}>Consultar inventário autorizado</button>
@@ -302,6 +308,12 @@ export default function Research() {
     <section className="card"><h2>Importar documento científico autorizado</h2><form className="stack" onSubmit={upload}>
       <input required placeholder="Título do trabalho" value={title} onChange={e => setTitle(e.target.value)} />
       <select value={rights} onChange={e => setRights(e.target.value)}><option value="open_access">Acesso aberto (com direitos verificados)</option><option value="author_permission">Permissão do autor</option><option value="institutional_permission">Permissão institucional (acesso restrito)</option></select>
+      {rights === 'institutional_permission' && <label>Instituto responsável
+        <select required value={institute} onChange={e => setInstitute(e.target.value)}>
+          <option value="">Selecione o instituto autorizado</option>
+          {(identity?.role === 'admin' ? ['inovaligno', 'polissacarideos', 'circularidade'] : identity?.institutes || []).map(name => <option value={name} key={name}>{name}</option>)}
+        </select>
+      </label>}
       <label><input type="checkbox" checked={trainingAllowed} onChange={e => setTrainingAllowed(e.target.checked)} /> Permissão específica confirmada para treinamento local</label>
       <input type="file" accept="application/pdf,.pdf" required onChange={e => setFile(e.target.files?.[0] || null)} />
       <button disabled={!token || !file || !title}>Importar PDF</button>

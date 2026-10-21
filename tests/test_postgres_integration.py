@@ -53,9 +53,9 @@ def test_postgres_cas_across_processes_and_retention(tmp_path):
     url = os.environ['BIA_TEST_POSTGRES_URL']
     assert url.startswith('postgresql+')
     factory = make_session_factory(url)
-    assert upgrade_schema(factory.kw['bind'], auto=False) == '0003'
+    assert upgrade_schema(factory.kw['bind'], auto=False) == '0004'
     with factory() as session:
-        assert session.execute(text('SELECT version FROM bia_schema_versions ORDER BY version')).scalars().all() == ['0001','0002','0003']
+        assert session.execute(text('SELECT version FROM bia_schema_versions ORDER BY version')).scalars().all() == ['0001','0002','0003','0004']
     client = TestClient(make_app(db_url=url, storage_dir=tmp_path / 'assets', keys=KEYS))
     uploaded = client.post('/v1/documents', headers=_auth('alice'),
         data={'title':'Estudo sob concorrencia', 'rights_basis':'open_access','training_allowed':'true'},
@@ -107,3 +107,30 @@ def test_postgres_snapshot_trigger_blocks_mutation(tmp_path):
                             {'p':'changed', 'h': digest})
         session.rollback()
         assert session.get(DatasetSnapshot, digest).payload_json == '{}'
+
+
+def test_postgres_institution_boundaries_and_audit(tmp_path):
+    """PostgreSQL 16: verify institutional isolation with real SQL and schema v0004."""
+    from bia_core.db import AuditEvent
+    url = os.environ['BIA_TEST_POSTGRES_URL']
+    scopes = {
+        'ligno': {'actor': 'ligno', 'role': 'curator', 'institutes': ['inovaligno']},
+        'poly': {'actor': 'poly', 'role': 'curator', 'institutes': ['polissacarideos']},
+        'admin': {'actor': 'admin', 'role': 'admin'},
+    }
+    client = TestClient(make_app(db_url=url, storage_dir=tmp_path / 'tenant-assets', keys=scopes))
+    payload = 'SCIENCE_' + uuid4().hex
+    result = client.post('/v1/documents', headers=_auth('ligno'),
+        data={'title': payload, 'rights_basis': 'institutional_permission',
+              'training_allowed': 'false', 'institute': 'inovaligno'},
+        files={'file': ('sample.pdf', _pdf(payload), 'application/pdf')})
+    assert result.status_code == 201, result.text
+    doc = result.json()['id']
+    assert client.get(f'/v1/documents/{doc}', headers=_auth('poly')).status_code == 404
+    assert client.get(f'/v1/documents/{doc}/passages', headers=_auth('poly')).status_code == 404
+    assert client.get(f'/v1/documents/{doc}', headers=_auth('ligno')).status_code == 200
+    assert client.get('/v1/audit/events?actor=ligno', headers=_auth('poly')).status_code == 403
+    with make_session_factory(url)() as session:
+        assert session.get(Document, doc).institute == 'inovaligno'
+        assert session.scalars(select(AuditEvent).where(
+            AuditEvent.actor == 'ligno', AuditEvent.action == 'document.metadata.read')).first()

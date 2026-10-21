@@ -18,6 +18,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from bia_core.db import Annotation, AuditEvent, Document, Passage, PassageReview, ScientificRelation, TrainingRun, RelationModelRun, RelationNegativeAssessment, make_session_factory, now
+from bia_core.access import compile_keys, authenticate, can_read, upload_scope
 from bia_core.ingestion import InvalidPDF, pages_from_pdf
 from bia_core.curation import annotations_for, review_state
 from bia_core.model import ENTITY_LABELS
@@ -120,6 +121,11 @@ class GovernanceDecision(BaseModel):
     reason: str = Field(min_length=10, max_length=500)
 
 
+class AssignInstitution(BaseModel):
+    institute: Literal["inovaligno", "polissacarideos", "circularidade"]
+    reason: str = Field(min_length=10, max_length=500)
+
+
 class TrainRequest(BaseModel):
     epochs: int = Field(default=2, ge=1, le=25)
     seed: int = Field(default=42, ge=0, le=2**31 - 1)
@@ -131,8 +137,9 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
     root = Path(artifact_root or os.getenv("BIA_MODEL_BASE_DIR", "./checkpoints")).resolve()
     storage.mkdir(parents=True, exist_ok=True)
     key_config = keys if keys is not None else json.loads(os.getenv("BIA_API_KEYS", "{}"))
-    if not isinstance(key_config, dict):
-        raise ValueError("BIA_API_KEYS deve ser objeto JSON")
+    compiled_keys = compile_keys(key_config)
+    configured_curators = {profile["actor"] for _, profile in compiled_keys
+                           if profile["role"] in ("curator", "admin")}
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bia-train")
     job_lock = Lock()
     app = FastAPI(title="bIA Scientific Core", version="0.1.0", docs_url="/docs")
@@ -146,14 +153,12 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
     def principal(authorization: str | None = Header(default=None)) -> dict:
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(401, "Token Bearer obrigatório")
-        # Constant-time comparison for configured secrets.
-        import hmac
         token = authorization.removeprefix("Bearer ")
-        for candidate, profile in key_config.items():
-            if hmac.compare_digest(token, candidate):
-                if not isinstance(profile, dict) or profile.get("role") not in ROLES or not profile.get("actor"):
-                    break
-                return profile
+        if not token or len(token) > 4096:
+            raise HTTPException(401, "Token inválido")
+        profile = authenticate(compiled_keys, token)
+        if profile:
+            return profile
         raise HTTPException(401, "Token inválido")
 
     def role(*allowed):
@@ -164,12 +169,15 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
         return require
 
     def visible(doc: Document, user: dict) -> bool:
-        if doc.status == "restricted":
-            return user["role"] == "admin"
-        return doc.rights_basis != "institutional_permission" or user["role"] in ("curator", "admin")
+        return can_read(doc, user)
 
     def audit(session, user, action, resource):
         session.add(AuditEvent(actor=user["actor"], action=action, resource=resource))
+
+    def audit_sensitive_read(session, user, doc, action):
+        if doc.rights_basis == "institutional_permission":
+            audit(session, user, action, f"{doc.id}:{doc.institute or 'unclassified'}")
+            session.commit()
 
     def flush_unique(session, message):
         try:
@@ -200,14 +208,26 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
     def health():
         return {"status": "ok", "service": "bia", "ai_provider": "local-only"}
 
+    @app.get("/v1/auth/me")
+    def whoami(user: dict = Depends(principal)):
+        return {"actor": user["actor"], "role": user["role"],
+                "institutes": list(user["institutes"]), "auth_method": "bearer-local"}
+
     @app.post("/v1/documents", status_code=201)
     async def upload_document(
         file: UploadFile = File(...), title: str = Form(...), rights_basis: str = Form(...),
         training_allowed: bool = Form(False), doi: str | None = Form(None), year: int | None = Form(None),
+        institute: str | None = Form(None),
         user: dict = Depends(role("curator", "admin")), session: Session = Depends(db),
     ):
         if rights_basis not in ALLOWED_RIGHTS:
             raise HTTPException(422, "Defina uma base de direitos permitida")
+        try:
+            assigned_institute = upload_scope(user, rights_basis, institute)
+        except PermissionError as exc:
+            raise HTTPException(403, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
         if not 1 <= len(title.strip()) <= 500 or year is not None and not 1500 <= year <= 2100:
             raise HTTPException(422, "Título ou ano inválido")
         if doi and normalize_doi(doi) is None:
@@ -225,11 +245,15 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
         digest = sha256(contents).hexdigest()
         prior = session.scalar(select(Document).where(Document.sha256 == digest))
         if prior:
+            # Sem revelar ID/metadata de documentos de outro instituto.
+            if not visible(prior, user):
+                raise HTTPException(409, "PDF já cadastrado")
             raise HTTPException(409, {"message": "PDF já cadastrado", "document_id": prior.id})
         document_path = storage / f"{digest}.pdf"
         # No uploaded filename is ever used for filesystem paths.
         document_path.write_bytes(contents)
         document = Document(title=title.strip(), doi=normalize_doi(doi) if doi else None, year=year,
+                            institute=assigned_institute,
                             rights_basis=rights_basis, training_allowed=training_allowed,
                             sha256=digest, asset_path=str(document_path),
                             status="ready" if any(text.strip() for _, text in pages) else "needs_review")
@@ -240,7 +264,8 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
                 session.add(Passage(document_id=document.id, page=page, text=text, start_offset=0, end_offset=len(text)))
         audit(session, user, "document.upload", document.id)
         session.commit()
-        return {"id": document.id, "sha256": digest, "status": document.status, "pages": len(pages)}
+        return {"id": document.id, "sha256": digest, "status": document.status,
+                "institute": document.institute, "pages": len(pages)}
 
     @app.put("/v1/documents/{document_id}/governance")
     def update_document_governance(document_id: str, data: GovernanceDecision,
@@ -286,16 +311,38 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
                          user: dict = Depends(role("admin",)), session: Session = Depends(db)):
         return corpus_manifest(session, offset=offset, limit=limit)
 
+    @app.put("/v1/documents/{document_id}/institution")
+    def assign_document_institute(document_id: str, data: AssignInstitution,
+                                  user: dict = Depends(role("admin",)), session: Session = Depends(db)):
+        doc = session.get(Document, document_id)
+        if doc is None:
+            raise HTTPException(404, "Documento não encontrado")
+        if doc.rights_basis != "institutional_permission":
+            raise HTTPException(409, "Somente documentos institucionais podem receber instituto")
+        if session.get_bind().dialect.name == "postgresql":
+            session.scalar(select(Document).where(Document.id == document_id).with_for_update())
+            session.refresh(doc)
+        if doc.institute and doc.institute != data.institute:
+            raise HTTPException(409, "Transferência interinstitucional exige procedimento próprio")
+        if doc.institute == data.institute:
+            raise HTTPException(409, "Documento já classificado neste instituto")
+        doc.institute = data.institute
+        audit(session, user, "document.institution.assign", f"{document_id}:{data.institute}")
+        session.commit()
+        return {"document_id": doc.id, "institute": doc.institute, "status": "assigned"}
+
     @app.get("/v1/documents/{document_id}")
     def document_details(document_id: str, user: dict = Depends(role(*ROLES)), session: Session = Depends(db)):
         doc = get_doc(session, document_id, user)
+        audit_sensitive_read(session, user, doc, "document.metadata.read")
         return {"id": doc.id, "title": doc.title, "doi": doc.doi, "year": doc.year,
                 "rights_basis": doc.rights_basis, "training_allowed": doc.training_allowed,
-                "sha256": doc.sha256, "status": doc.status}
+                "institute": doc.institute, "sha256": doc.sha256, "status": doc.status}
 
     @app.get("/v1/documents/{document_id}/passages")
     def document_passages(document_id: str, user: dict = Depends(role(*ROLES)), session: Session = Depends(db)):
-        get_doc(session, document_id, user)
+        document = get_doc(session, document_id, user)
+        audit_sensitive_read(session, user, document, "document.passages.read")
         items = session.scalars(select(Passage).where(Passage.document_id == document_id).order_by(Passage.page)).all()
         return [{"id": p.id, "document_id": p.document_id, "page": p.page, "text": p.text,
                  "start_offset": p.start_offset, "end_offset": p.end_offset,
@@ -310,6 +357,11 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
         scores = bm25(q, [p.text for p, _ in pairs])
         ranked = sorted(((scores[i], p, d) for i, (p, d) in enumerate(pairs) if scores[i] > 0),
                         key=lambda item: (-item[0], item[1].id))[:limit]
+        for doc in {d.id: d for _, _, d in ranked}.values():
+            if doc.rights_basis == "institutional_permission":
+                audit(session, user, "document.search.read", f"{doc.id}:{doc.institute}")
+        if any(d.rights_basis == "institutional_permission" for _, _, d in ranked):
+            session.commit()
         return {"query": q, "results": [{"score": score, "document_id": doc.id, "title": doc.title,
                  "doi": doc.doi, "page": p.page, "passage_id": p.id, "quote": p.text[:1200],
                  "rights_basis": doc.rights_basis} for score, p, doc in ranked],
@@ -377,19 +429,34 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
         get_doc(session, passage.document_id, user)
         return review_state(session, passage_id)
 
+    @app.get("/v1/audit/events")
+    def audit_events(limit: int = Query(default=100, ge=1, le=500),
+                     actor: str | None = Query(default=None, max_length=128),
+                     user: dict = Depends(role("admin",)), session: Session = Depends(db)):
+        query = select(AuditEvent).order_by(AuditEvent.created_at.desc(), AuditEvent.id.desc())
+        if actor:
+            query = query.where(AuditEvent.actor == actor)
+        rows = session.scalars(query.limit(limit)).all()
+        return {"items": [{"id": row.id, "actor": row.actor, "action": row.action,
+                           "resource": row.resource, "created_at": row.created_at.isoformat()} for row in rows],
+                "total_returned": len(rows), "audit_scope": "global_admin_only"}
+
     @app.get("/v1/curation/summary")
     def curation_summary(user: dict = Depends(role("curator", "admin")), session: Session = Depends(db)):
         """Readiness counts, never confuse annotation volume with validated science."""
-        documents = session.scalars(select(Document)).all()
+        documents = [d for d in session.scalars(select(Document)).all() if visible(d, user)]
+        visible_ids = {d.id for d in documents}
         reviews = {
             row.passage_id: row.status
             for row in session.scalars(select(PassageReview)).all()
         }
-        passages = session.scalars(select(Passage)).all()
+        passages = [p for p in session.scalars(select(Passage)).all() if p.document_id in visible_ids]
         states = {"draft": 0, "submitted": 0, "certified": 0}
         eligible = 0
-        open_disputes = sum(1 for case in session.scalars(select(AnnotationDispute)).all() if case.status != "resolved")
-        bibliography_decisions = len(session.scalars(select(BibliographicDecision.id)).all())
+        open_disputes = sum(1 for case in session.scalars(select(AnnotationDispute)).all()
+                            if case.status != "resolved" and case.passage_id in {p.id for p in passages})
+        bibliography_decisions = sum(1 for row in session.scalars(select(BibliographicDecision)).all()
+                                     if row.left_document_id in visible_ids and row.right_document_id in visible_ids)
         allowed = {d.id for d in documents if d.training_allowed}
         for passage in passages:
             status = reviews.get(passage.id, "draft")
@@ -834,8 +901,7 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
             raise HTTPException(422, "São necessárias duas identidades diferentes")
         # Não é permitido criar tarefas destinadas a identidades que não possuem
         # permissão de curadoria configurada para esta instância.
-        configured = {profile.get("actor") for profile in key_config.values()
-                      if isinstance(profile, dict) and profile.get("role") in ("curator", "admin")}
+        configured = configured_curators
         if a not in configured or b not in configured:
             raise HTTPException(422, "Revisores precisam possuir credenciais de curadoria válidas")
         a, b = sorted((a, b))
@@ -975,7 +1041,7 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
         if institute not in INSTITUTES:
             raise HTTPException(404, "Instituto não reconhecido")
         membership = user.get("institutes", [])
-        if not isinstance(membership, list) or institute not in membership:
+        if not isinstance(membership, (tuple, list)) or institute not in membership:
             raise HTTPException(403, "Afiliação não habilitada para este instituto")
 
     @app.get("/v1/institutes/{institute}/protocol")

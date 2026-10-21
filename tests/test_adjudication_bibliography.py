@@ -15,9 +15,9 @@ from bia_core.training import document_splits, source_dataset
 from bia_core.relation_learning import grouped_splits
 
 KEYS = {
-    "alice": {"role": "curator", "actor": "alice"},
-    "bruno": {"role": "curator", "actor": "bruno"},
-    "carla": {"role": "curator", "actor": "carla"},
+    "alice": {"role": "curator", "actor": "alice", "institutes": ["inovaligno"]},
+    "bruno": {"role": "curator", "actor": "bruno", "institutes": ["inovaligno"]},
+    "carla": {"role": "curator", "actor": "carla", "institutes": ["inovaligno"]},
     "administrator": {"role": "admin", "actor": "administrator"},
     "reader": {"role": "viewer", "actor": "reader"},
 }
@@ -44,6 +44,8 @@ def env(tmp_path):
 
 def insert(client, title, text, doi=None, year=None, rights="open_access", actor="alice"):
     data = {"title": title, "rights_basis": rights, "training_allowed": "true"}
+    if rights == "institutional_permission":
+        data["institute"] = "inovaligno"
     if doi:
         data["doi"] = doi
     if year is not None:

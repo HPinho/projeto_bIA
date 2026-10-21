@@ -83,9 +83,9 @@ def test_schema_migrates_old_versionless_db_and_preserves_documents(tmp_path):
     factory = make_session_factory(db)
     with factory() as session:
         assert session.get(Document, 'a' * 32).title == 'LEGACY'
-        assert session.execute(text('SELECT version FROM bia_schema_versions ORDER BY version')).scalars().all() == ['0001', '0002', '0003']
+        assert session.execute(text('SELECT version FROM bia_schema_versions ORDER BY version')).scalars().all() == ['0001', '0002', '0003', '0004']
     assert {'dataset_snapshots', 'institute_assessments', 'document_governance'}.issubset(inspect(engine).get_table_names())
-    assert upgrade_schema(engine) == '0003'
+    assert upgrade_schema(engine) == '0004'
 
 
 def test_schema_requires_explicit_upgrade_and_rejects_partial(tmp_path):

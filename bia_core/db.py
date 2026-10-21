@@ -26,6 +26,7 @@ class Document(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     doi: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    institute: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     year: Mapped[int | None] = mapped_column(Integer, nullable=True)
     rights_basis: Mapped[str] = mapped_column(String(64), nullable=False)
     training_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)

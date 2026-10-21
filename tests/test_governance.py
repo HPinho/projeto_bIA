@@ -151,11 +151,12 @@ def test_0002_to_0003_upgrade_preserves_snapshots(environment):
     _, factory = environment
     engine = factory.kw['bind']
     with engine.begin() as conn:
+        conn.execute(text("DELETE FROM bia_schema_versions WHERE version='0004'"))
         conn.execute(text("DELETE FROM bia_schema_versions WHERE version='0003'"))
         conn.execute(text('DROP TABLE document_governance'))
-    assert upgrade_schema(engine) == '0003'
+    assert upgrade_schema(engine) == '0004'
     with factory() as session:
-        assert session.execute(text('SELECT version FROM bia_schema_versions ORDER BY version')).scalars().all() == ['0001','0002','0003']
+        assert session.execute(text('SELECT version FROM bia_schema_versions ORDER BY version')).scalars().all() == ['0001','0002','0003','0004']
 
 
 def test_manifest_excludes_raw_text_and_lists_training_obstacles(environment):

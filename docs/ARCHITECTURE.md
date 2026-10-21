@@ -71,3 +71,18 @@ A adjudicação preserva as alternativas de duas identidades, exige uma terceira
 ## Extensão BIA-02.7
 
 A migração `0003` instala `document_governance`: restrição de acesso e treinamento, prazo de revisão da retenção e guarda legal sem exclusões automáticas. Transições de submissão/certificação/reabertura usam operações SQL condicionais; PostgreSQL usa lock de linha do trecho nas mutações de curadoria. O CI possui testes transacionais com serviço PostgreSQL 16 e processos distintos. Inventário de prontidão é **somente administrativo**, sem conteúdo de PDFs. Ver [BLOCO_02_7_TRANSACOES_RETENCAO.md](BLOCO_02_7_TRANSACOES_RETENCAO.md).
+
+
+## BIA-02.8 — Auth local e isolamento institucional (2026-10-21)
+
+A autenticação Bearer utiliza perfis declarados com papéis e afiliação explícitos;
+no processo da API as credenciais são verificadas por digest e comparação
+constante. A coluna `documents.institute`, migrada em `0004`, é obrigatória
+para novas fontes institucionais. `get_doc`, busca, relações, duplicatas e
+resumo de curadoria aplicam autorização antes de apresentar conteúdo. Fontes
+legadas não classificadas ficam restritas ao administrador.
+
+Admin é um superusuário global deliberado, e seu acesso deve ser auditado.
+O corpus gold e o treinamento **não possuem ainda isolamento de modelos por
+instituto** e continuam exclusivos de administrador. Isto é um protótipo, não
+um sistema pronto para informação institucional sensível em rede aberta.

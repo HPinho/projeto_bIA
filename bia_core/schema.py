@@ -2,6 +2,8 @@
 
 0001 marca o esquema histórico; 0002 adiciona avaliações e snapshots append-only;
 0003 adiciona governança de retenção sem remover fontes nem direitos históricos.
+0004 adiciona a afiliação opcional; documentos institucionais antigos não classificados
+ficam inacessíveis a curadores até atribuição explícita por administrador.
 Não modifica colunas antigas nem elimina dados. Instalações antigas sem tabela de versão
 são reconhecidas somente quando o conjunto de tabelas histórico está completo.
 """
@@ -13,7 +15,7 @@ from datetime import datetime, timezone
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
 
-VERSIONS = ("0001", "0002", "0003")
+VERSIONS = ("0001", "0002", "0003", "0004")
 VERSION_TABLE = "bia_schema_versions"
 
 
@@ -74,6 +76,17 @@ def upgrade_schema(engine: Engine, *, auto: bool = True) -> str:
                 Base.metadata.create_all(conn, tables=[Base.metadata.tables["document_governance"]], checkfirst=True)
                 conn.execute(text("INSERT INTO bia_schema_versions (version, installed_utc) VALUES (:version, :at)"),
                              {"version": VERSIONS[2], "at": datetime.now(timezone.utc).isoformat()})
+            if VERSIONS[3] not in recorded:
+                if not auto:
+                    raise RuntimeError("Schema desatualizado; execute python -m bia_core.schema")
+                column_names = {col["name"] for col in inspect(conn).get_columns("documents")}
+                if "institute" not in column_names:
+                    conn.execute(text("ALTER TABLE documents ADD COLUMN institute VARCHAR(32)"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_documents_institute ON documents (institute)"))
+                conn.execute(text("INSERT INTO bia_schema_versions (version, installed_utc) VALUES (:version, :at)"),
+                             {"version": VERSIONS[3], "at": datetime.now(timezone.utc).isoformat()})
+            if "institute" not in {col["name"] for col in inspect(conn).get_columns("documents")}:
+                raise RuntimeError("Coluna de isolamento institucional ausente")
             if engine.dialect.name == "sqlite":
                 installed = {r[0] for r in conn.exec_driver_sql(
                     "SELECT name FROM sqlite_master WHERE type='trigger' AND name IN ('bia_snapshot_no_update', 'bia_snapshot_no_delete')")}
