@@ -73,7 +73,7 @@ Os testes geram PDFs e corpus sintéticos; não baixam modelos e não exigem GPU
 
 Consulte [a arquitetura e limitações](docs/ARCHITECTURE.md) para planejamento de produção e critérios científicos pendentes.
 
-**Próxima frente:** Bloco 02 — extração de relações experimentais, após validação do Bloco 01 e definição do recorte pelos três INCTs.
+**Evolução:** consulte os blocos 02.1 a 02.4 abaixo; o recorte e a validação científica continuam pendentes com os três INCTs.
 
 ## Bloco 02.1 — Relações entre materiais e experimentos
 
@@ -110,3 +110,26 @@ O endpoint `GET /v1/relation-models/runs/{id}/evaluation` (somente administrador
 **Estado científico:** ainda não existe dataset de referência aprovado pelos três INCTs, e os testes unitários são sintéticos. A bIA não afirma desempenho real validado, nem converte escore neural em evidência científica.
 
 Leia [BIA-02.3 — Avaliação e protocolo científico](docs/BLOCO_02_3_AVALIACAO_CIENTIFICA.md). **Próxima frente: BIA-02.4 — adjudicação e deduplicação bibliográfica, incluindo duplicatas sem DOI.**
+
+## Bloco 02.4 — Divergências e duplicatas com revisão independente
+
+- Três curadores distintos para disputas (`POST /v1/adjudications`, `.../{id}/second` e `.../{id}/resolve`); a opção `neither` permite registrar que nenhuma alternativa tem evidência suficiente.
+- Divergências abertas bloqueiam submissão/certificação do trecho e impedem a geração acidental de exemplos negativos.
+- `GET /v1/documents/{id}/duplicates` apresenta DOI normalizado ou coincidência conservadora de título+ano. `POST /v1/bibliography/review` recebe `left_document_id`, `right_document_id`, `verdict` e `reason` e exige identidade diferente do upload.
+- Confirmar equivalência agrupa documentos nos futuros conjuntos de treino/validação/teste, **sem fundir PDFs, direitos ou evidências**. Não há alteração retroativa nos checkpoints.
+- Ambas as operações têm histórico auditável e painel na interface Next.js. O protótipo não oferece migrações/locks de produção.
+
+[Protocolo técnico BIA-02.4](docs/BLOCO_02_4_ADJUDICACAO_DEDUPLICACAO.md). **Próximo item:** BIA-02.5 — concordância entre revisores e exportação auditável de conjuntos adjudicados.
+
+## BIA-02.5 — concordância científica e datasets gold
+
+A bIA agora possui tarefas de avaliação cega **por intervalo e dupla fixa**, votos imutáveis, adjudicação por terceira identidade e κ de Cohen por dupla (ou `null` quando indefinido). Amostras precisam ser definidas antes do resultado; a concordância calculada sobre amostras escolhidas manualmente não valida todo o acervo.
+
+- `POST /v1/agreement/tasks`, `GET /v1/agreement/tasks?passage_id=...`, `GET /v1/agreement/tasks/{id}`: atribuição de intervalos, avaliação e status sem antecipar votos.
+- `POST /v1/agreement/tasks/{id}/vote` e `POST /v1/agreement/tasks/{id}/adjudicate`: observação independente e parecer final por terceira identidade.
+- `GET /v1/agreement/metrics` (admin): proporções e concordância por dupla fixa, matriz de confusão e κ definido ou nulo.
+- `GET /v1/datasets/gold/export` (admin): exportação **interna e sem redistribuição** de texto e rótulos certificados, autorizados para treinamento, reconciliados com tarefas de concordância. Conteúdo inclui `sha256` do snapshot e splits por publicação; não contém nomes de revisores.
+
+O pipeline de treino de entidades recusa amostras pendentes ou conflitantes; o treino de relações também não usa essas amostras. A decisão estatística **não cria rótulos automaticamente**: anotações certificadas precisam concordar com a adjudicação antes do treinamento.
+
+[Detalhes e limites do BIA-02.5](docs/BLOCO_02_5_CONCORDANCIA_GOLD.md). **Próxima frente: BIA-02.6 — migrações, concorrência e snapshots imutáveis auditados.**

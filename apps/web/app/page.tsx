@@ -3,12 +3,17 @@ import { FormEvent, useState } from 'react';
 
 const BASE = process.env.NEXT_PUBLIC_BIA_API_URL || 'http://localhost:8000';
 type Hit = { document_id: string; title: string; doi: string | null; passage_id: string; page: number; score: number; quote: string };
-type ReviewState = { status: string; submitted_by: string | null; certified_by: string | null; approved_annotations: number; pending_annotations: number; rejected_annotations: number };
-type Passage = { id: string; page: number; text: string; review: ReviewState };
+type ReviewState = { status: string; submitted_by: string | null; certified_by: string | null; approved_annotations: number; pending_annotations: number; rejected_annotations: number; unresolved_disputes: number };
+type Passage = { id: string; document_id: string; page: number; text: string; review: ReviewState };
 type Annotation = { id: string; label: string; start: number; end: number; quote: string; status: string };
 type CandidateRelation = { subject_annotation_id: string; object_annotation_id: string; relation_type: string; evidence_start: number; evidence_end: number; evidence_quote: string; status: string };
 type PredictedRelation = CandidateRelation & { model_score_uncalibrated: number; scientifically_validated: false };
 type CuratedRelation = { id: string; relation_type: string; status: string; verified: boolean; certification_current: boolean; evidence_quote: string; proposed_by: string; reviewed_by: string | null };
+type DisputeAlternative = { actor: string; label: string; start: number; end: number; quote: string };
+type Dispute = { id: string; status: string; first: DisputeAlternative; second: DisputeAlternative | null; resolution: string | null; reason: string | null; adjudicated_by: string | null; annotation_id: string | null };
+type Duplicate = { document_id: string; title: string; doi: string | null; year: number | null; signals: string[]; verdict: string; reviewed_by: string | null };
+type AgreementTask = { id: string; passage_id: string; quote: string; start: number; end: number; raters: string[]; complete: boolean; votes_received: number; needs_adjudication: boolean; adjudicated: boolean; votes?: { a: string; b: string }; final_label?: string | null };
+type AgreementMetric = { rater_a: string; rater_b: string; tasks: number; complete: number; agreement_rate: number | null; cohen_kappa: number | null; kappa_defined: boolean };
 type VerifiedRelation = { id: string; title: string; doi: string | null; page: number; relation_type: string; subject: { quote: string }; object: { quote: string }; evidence: { quote: string }; review: { proposed_by: string; reviewed_by: string } };
 
 export default function Research() {
@@ -17,6 +22,10 @@ export default function Research() {
   const [hits, setHits] = useState<Hit[]>([]);
   const [passages, setPassages] = useState<Passage[]>([]);
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
+  const [disputes, setDisputes] = useState<Dispute[]>([]);
+  const [duplicateCandidates, setDuplicateCandidates] = useState<Duplicate[]>([]);
+  const [bibliographyReason, setBibliographyReason] = useState('Documentos comparados com evidências bibliográficas originais');
+  const [adjudicationReason, setAdjudicationReason] = useState('Texto original e offsets revisados pelos três pesquisadores');
   const [reviewState, setReviewState] = useState<ReviewState | null>(null);
   const [selected, setSelected] = useState('');
   const [message, setMessage] = useState('');
@@ -29,6 +38,13 @@ export default function Research() {
   const [curatedRelations, setCuratedRelations] = useState<CuratedRelation[]>([]);
   const [relationResults, setRelationResults] = useState<VerifiedRelation[]>([]);
   const [relationQuery, setRelationQuery] = useState('celulose');
+  const [agreementTasks, setAgreementTasks] = useState<AgreementTask[]>([]);
+  const [raterA, setRaterA] = useState('alice');
+  const [raterB, setRaterB] = useState('bruno');
+  const [agreementLabel, setAgreementLabel] = useState('MATERIAL');
+  const [agreementReason, setAgreementReason] = useState('Decisão conferida com o documento original e seus offsets');
+  const [agreementMetrics, setAgreementMetrics] = useState<AgreementMetric[] | null>(null);
+  const [agreementExport, setAgreementExport] = useState('');
   const [label, setLabel] = useState('MATERIAL');
   const [start, setStart] = useState(0);
   const [end, setEnd] = useState(1);
@@ -59,14 +75,14 @@ export default function Research() {
     await exec(async () => {
       const result: Passage[] = await api(`/v1/documents/${documentId}/passages`);
       setPassages(result); setSelected(result[0]?.id || '');
-      setCandidates([]); setCuratedRelations([]); setPredictions([]); setModelOutput('');
+      setCandidates([]); setCuratedRelations([]); setPredictions([]); setModelOutput(''); setDisputes([]); setDuplicateCandidates([]);
       if (result[0]) { setAnnotations(await api('/v1/annotations/' + result[0].id)); setReviewState(result[0].review); }
       else { setAnnotations([]); setReviewState(null); }
     });
   }
   async function choosePassage(id: string) {
     await exec(async () => {
-      setSelected(id); setCandidates([]); setCuratedRelations([]); setPredictions([]); setModelOutput('');
+      setSelected(id); setCandidates([]); setCuratedRelations([]); setPredictions([]); setModelOutput(''); setDisputes([]);
       setAnnotations(await api('/v1/annotations/' + id));
       setReviewState(await api('/v1/passages/' + id + '/review'));
     });
@@ -103,6 +119,90 @@ export default function Research() {
       await api(`/v1/annotations/${id}/review`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ decision }) });
       setAnnotations(await api('/v1/annotations/' + selected));
       setReviewState(await api('/v1/passages/' + selected + '/review'));
+    });
+  }
+  async function refreshDisputes() {
+    if (!selected) return;
+    const results = await api(`/v1/passages/${selected}/adjudications`);
+    setDisputes(results.cases);
+    setReviewState(await api(`/v1/passages/${selected}/review`));
+    setAnnotations(await api(`/v1/annotations/${selected}`));
+  }
+  async function createDispute() {
+    await exec(async () => {
+      await api('/v1/adjudications', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ passage_id: selected, alternative: { label, start, end } }) });
+      await refreshDisputes(); setMessage('Primeira opinião registrada; outro pesquisador deve enviar a segunda.');
+    });
+  }
+  async function secondDispute(id: string) {
+    await exec(async () => {
+      await api(`/v1/adjudications/${id}/second`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label, start, end }) });
+      await refreshDisputes(); setMessage('Segunda opinião registrada. Uma terceira identidade deverá adjudicar.');
+    });
+  }
+  async function resolveDispute(id: string, resolution: 'first' | 'second' | 'neither') {
+    await exec(async () => {
+      await api(`/v1/adjudications/${id}/resolve`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ resolution, reason: adjudicationReason }) });
+      await refreshDisputes(); setMessage('Divergência adjudicada e registrada em auditoria.');
+    });
+  }
+  async function refreshAgreement() {
+    if (!selected) return;
+    const result = await api('/v1/agreement/tasks?passage_id=' + encodeURIComponent(selected));
+    setAgreementTasks(result.tasks);
+  }
+  async function createAgreementTask() {
+    await exec(async () => {
+      await api('/v1/agreement/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ passage_id: selected, start, end, rater_a: raterA, rater_b: raterB }) });
+      await refreshAgreement(); setMessage('Intervalo definido antes dos votos; cada revisor deve entrar com seu próprio token.');
+    });
+  }
+  async function castAgreementVote(id: string) {
+    await exec(async () => {
+      await api(`/v1/agreement/tasks/${id}/vote`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label: agreementLabel }) });
+      await refreshAgreement(); setMessage('Voto registrado sem revelar a opção ao outro revisor.');
+    });
+  }
+  async function adjudicateAgreement(id: string) {
+    await exec(async () => {
+      await api(`/v1/agreement/tasks/${id}/adjudicate`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label: agreementLabel, reason: agreementReason }) });
+      await refreshAgreement(); setMessage('Decisão da terceira identidade registrada sem substituir os votos originais.');
+    });
+  }
+  async function loadAgreementMetrics() {
+    await exec(async () => {
+      const report = await api('/v1/agreement/metrics');
+      setAgreementMetrics(report.by_fixed_rater_pair);
+      setMessage(`${report.tasks} amostras pré-definidas, ${report.pending_adjudications} discordâncias pendentes.`);
+    });
+  }
+  async function inspectGoldExport() {
+    await exec(async () => {
+      const snapshot = await api('/v1/datasets/gold/export');
+      setAgreementExport(`Dataset ${snapshot.sha256} · ${snapshot.passages} trechos autorizados · ${snapshot.publications} publicações agrupadas. Uso interno; sem redistribuição.`);
+      setMessage('Snapshot recalculado e identificado por SHA-256. A exportação íntegra está disponível no endpoint restrito a administradores.');
+    });
+  }
+  async function inspectDuplicates() {
+    await exec(async () => {
+      const docId = passages[0]?.document_id;
+      if (!docId) throw Error('Selecione um documento antes de pesquisar duplicatas.');
+      const result = await api(`/v1/documents/${docId}/duplicates`);
+      setDuplicateCandidates(result.candidates);
+      setMessage(result.candidates.length ? 'Possíveis duplicatas: nenhum PDF foi mesclado.' : 'Nenhum possível par bibliográfico localizado.');
+    });
+  }
+  async function reviewDuplicate(id: string, verdict: 'same_publication' | 'distinct_publication') {
+    await exec(async () => {
+      await api('/v1/bibliography/review', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ left_document_id: passages[0].document_id, right_document_id: id, verdict, reason: bibliographyReason }) });
+      await inspectDuplicates(); setMessage('Parecer bibliográfico registrado; fontes e direitos preservados.');
     });
   }
   async function loadRelations() {
@@ -175,7 +275,7 @@ export default function Research() {
     });
   }
   return <main>
-    <header><span className="badge">Bloco 02.3 · Avaliação por publicação e IA local</span><h1>bIA</h1><p className="muted">Inteligência de materiais com fontes verificáveis · modelo próprio · processamento local</p></header>
+    <header><span className="badge">Bloco 02.5 · Concordância científica e datasets auditáveis</span><h1>bIA</h1><p className="muted">Inteligência de materiais com fontes verificáveis · modelo próprio · processamento local</p></header>
     <section className="card stack"><h2>Conexão com o laboratório</h2><label>Token de acesso (somente memória desta aba)</label><input type="password" value={token} autoComplete="off" onChange={e => setToken(e.target.value)} placeholder="Bearer token configurado na API" /><small>Use tokens diferentes para criar e revisar anotações. Não utilize este protótipo publicamente sem autenticação institucional.</small></section>
     <section className="card"><h2>Importar documento científico autorizado</h2><form className="stack" onSubmit={upload}>
       <input required placeholder="Título do trabalho" value={title} onChange={e => setTitle(e.target.value)} />
@@ -188,7 +288,7 @@ export default function Research() {
       {hits.map(hit => <article className="result" key={hit.passage_id}><strong>{hit.title}</strong><p className="muted">Página {hit.page} · DOI {hit.doi || 'não informado'} · pontuação BM25 {hit.score.toFixed(3)}</p><pre>{hit.quote}</pre><button onClick={() => loadPassages(hit.document_id)}>Inspecionar e anotar</button></article>)}
     </section>
     {!!passages.length && <section className="card stack"><h2>Anotação e revisão científica</h2><select value={selected} onChange={e => choosePassage(e.target.value)}>{passages.map(p => <option key={p.id} value={p.id}>Página {p.page}</option>)}</select>
-      <p className="muted">Revisão integral: <strong>{reviewState?.status || 'draft'}</strong> · aprovadas: {reviewState?.approved_annotations ?? 0} · pendentes: {reviewState?.pending_annotations ?? 0}. Um segundo pesquisador deve certificar inclusive trechos sem entidades.</p>
+      <p className="muted">Revisão integral: <strong>{reviewState?.status || 'draft'}</strong> · aprovadas: {reviewState?.approved_annotations ?? 0} · pendentes: {reviewState?.pending_annotations ?? 0} · divergências: {reviewState?.unresolved_disputes ?? 0}. Um segundo pesquisador deve certificar inclusive trechos sem entidades.</p>
       <div className="row">
         {reviewState?.status === 'draft' && <button type="button" onClick={() => changeReview('submit')}>Submeter trecho para certificação</button>}
         {reviewState?.status === 'submitted' && <button type="button" onClick={() => changeReview('certify')}>Certificar como segundo revisor</button>}
@@ -198,6 +298,55 @@ export default function Research() {
       <form className="row" onSubmit={annotate}><select value={label} onChange={e => setLabel(e.target.value)}>{['MATERIAL', 'PROCESS', 'PROPERTY', 'QUANTITY', 'UNIT', 'CONDITION', 'APPLICATION'].map(v => <option key={v}>{v}</option>)}</select>
         <label>Início <input type="number" min={0} value={start} onChange={e => setStart(Number(e.target.value))} /></label><label>Fim <input type="number" min={1} value={end} onChange={e => setEnd(Number(e.target.value))} /></label><button disabled={!token || reviewState?.status !== 'draft'}>Anotar</button></form>
       {annotations.map(a => <div key={a.id} className="result"><strong>{a.label}</strong> — “{a.quote}” ({a.status}) {a.status === 'pending' && <><button onClick={() => review(a.id, 'approved')}>Aprovar</button> <button onClick={() => review(a.id, 'rejected')}>Rejeitar</button></>}</div>)}
+      <section className="subpanel stack"><h3>Adjudicação de divergências (três pesquisadores)</h3>
+        <p className="muted">Os campos rótulo, início e fim acima definem a opinião enviada por cada pesquisador. A certificação do trecho permanece bloqueada enquanto existir divergência em aberto. Uma terceira identidade escolhe a primeira opinião, a segunda ou nenhuma.</p>
+        <div className="row"><button type="button" disabled={!selected || reviewState?.status !== 'draft'} onClick={createDispute}>Registrar primeira opinião</button>
+          <button type="button" onClick={() => exec(refreshDisputes)}>Atualizar divergências</button></div>
+        <label>Justificativa da adjudicação <input value={adjudicationReason} onChange={e => setAdjudicationReason(e.target.value)} /></label>
+        {disputes.map(d => <article className="result" key={d.id}>
+          <strong>{d.status}</strong> · primeira: {d.first.actor}, {d.first.label} “{d.first.quote}”
+          <p>Segunda: {d.second ? `${d.second.actor}, ${d.second.label} “${d.second.quote}”` : 'aguardando identidade independente'}</p>
+          {d.status === 'awaiting_second' && <button type="button" onClick={() => secondDispute(d.id)}>Enviar segunda opinião com os campos acima</button>}
+          {d.status === 'awaiting_adjudication' && <div className="row"><button type="button" onClick={() => resolveDispute(d.id, 'first')}>Escolher primeira</button>
+            <button type="button" onClick={() => resolveDispute(d.id, 'second')}>Escolher segunda</button>
+            <button type="button" onClick={() => resolveDispute(d.id, 'neither')}>Nenhuma sustentada</button></div>}
+          {d.status === 'resolved' && <small>Decisão: {d.resolution} · por {d.adjudicated_by} · motivo: {d.reason}</small>}
+        </article>)}
+      </section>
+      <section className="subpanel stack"><h3>Concordância independente · BIA-02.5</h3>
+        <p className="muted">Defina um intervalo com os campos Início/Fim acima <strong>antes</strong> da votação. As duas identidades não veem os votos até ambos terem respondido. Rótulo NONE indica ausência de entidade somente neste intervalo. Discordâncias exigem uma terceira identidade.</p>
+        <div className="row"><label>Revisor A <input value={raterA} onChange={e => setRaterA(e.target.value)} /></label>
+          <label>Revisor B <input value={raterB} onChange={e => setRaterB(e.target.value)} /></label>
+          <button type="button" disabled={!selected || !token} onClick={createAgreementTask}>Definir amostra cega</button>
+          <button type="button" onClick={() => exec(refreshAgreement)}>Atualizar amostras</button></div>
+        <label>Rótulo da avaliação <select value={agreementLabel} onChange={e => setAgreementLabel(e.target.value)}>
+          {['MATERIAL','PROCESS','PROPERTY','QUANTITY','UNIT','CONDITION','APPLICATION','NONE'].map(v => <option key={v}>{v}</option>)}
+        </select></label>
+        <label>Justificativa da terceira pessoa <input value={agreementReason} onChange={e => setAgreementReason(e.target.value)} /></label>
+        {agreementTasks.map(t => <article className="result" key={t.id}><strong>“{t.quote}”</strong>
+          <p className="muted">Offsets {t.start}–{t.end} · revisores {t.raters.join(' / ')} · votos {t.votes_received}/2</p>
+          {t.votes && <p>Opiniões: {t.votes.a} / {t.votes.b} · rótulo final: {t.final_label || 'aguardando adjudicação'}</p>}
+          {!t.complete && <button type="button" onClick={() => castAgreementVote(t.id)}>Enviar voto independente</button>}
+          {t.needs_adjudication && <button type="button" onClick={() => adjudicateAgreement(t.id)}>Adjudicar como terceira pessoa</button>}
+        </article>)}
+        <div className="row"><button type="button" onClick={loadAgreementMetrics}>Concordância por dupla (admin)</button>
+          <button type="button" onClick={inspectGoldExport}>Conferir snapshot gold (admin)</button></div>
+        {agreementMetrics && <div>{agreementMetrics.map(m => <p key={m.rater_a + m.rater_b}>
+          {m.rater_a} / {m.rater_b}: {m.complete}/{m.tasks} avaliações completas · concordância {m.agreement_rate?.toFixed(3) ?? 'indefinida'} · Cohen κ {m.kappa_defined ? m.cohen_kappa?.toFixed(3) : 'indefinido'}
+        </p>)}</div>}
+        {agreementExport && <p className="muted">{agreementExport}</p>}
+        <small>Amostras selecionadas manualmente não representam automaticamente todo o acervo. O κ só é calculado por dupla fixa de avaliadores.</small>
+      </section>
+      <section className="subpanel stack"><h3>Duplicatas bibliográficas</h3>
+        <p className="muted">Mesmo DOI ou título normalizado com ano igual sugerem revisão, não fusão automática. O revisor deve ser diferente do responsável pela ingestão. Publicações confirmadas como equivalentes ficam juntas nas divisões de treinamento e teste.</p>
+        <button type="button" onClick={inspectDuplicates}>Inspecionar possíveis duplicatas deste documento</button>
+        <label>Fundamentação da decisão <input value={bibliographyReason} onChange={e => setBibliographyReason(e.target.value)} /></label>
+        {duplicateCandidates.map(d => <article className="result" key={d.document_id}>
+          <strong>{d.title}</strong><p className="muted">DOI {d.doi || 'não informado'} · sinais: {d.signals.join(', ')} · {d.verdict}</p>
+          {d.verdict === 'unreviewed' && <div className="row"><button type="button" onClick={() => reviewDuplicate(d.document_id, 'same_publication')}>Mesma publicação</button>
+            <button type="button" onClick={() => reviewDuplicate(d.document_id, 'distinct_publication')}>Publicações diferentes</button></div>}
+        </article>)}
+      </section>
       <section className="subpanel stack"><h3>Relações entre materiais, processos e propriedades</h3>
         <p className="muted">Pares próximos no texto são <strong>somente sugestões</strong>. A relação proposta precisa incluir os dois argumentos na evidência literal e ser aprovada por outra identidade. Reabrir o trecho revoga a validade das relações anteriores.</p>
         <button type="button" disabled={!selected || !token || reviewState?.status !== 'certified'} onClick={loadRelations}>Carregar sugestões e revisões</button>

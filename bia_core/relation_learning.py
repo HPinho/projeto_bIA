@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from .db import Document, Passage, ScientificRelation, RelationNegativeAssessment
 from .evaluation import build_evaluation_report
 from .model import Block, ModelConfig
+from .bibliography import publication_clusters, normalize_doi
 from .relations import RELATION_SIGNATURES, certified_anchors
 from .tokenizer import CharTokenizer
 
@@ -78,14 +79,7 @@ class BiaRelationClassifier(nn.Module):
 
 def publication_hash(doi: str | None) -> str | None:
     """Versões de um artigo com mesmo DOI devem permanecer no mesmo split."""
-    if not doi or not doi.strip():
-        return None
-    normalized = doi.strip().lower()
-    for prefix in ("https://doi.org/", "http://doi.org/", "http://dx.doi.org/", "https://dx.doi.org/", "doi:"):
-        if normalized.startswith(prefix):
-            normalized = normalized[len(prefix):]
-            break
-    normalized = normalized.strip()
+    normalized = normalize_doi(doi)
     return digest(normalized.encode("utf-8")) if normalized else None
 
 
@@ -99,7 +93,11 @@ def reviewed_relations(session: Session) -> list[dict]:
         .order_by(Document.sha256, Passage.page, ScientificRelation.id)
     ).all()
     rows: list[dict] = []
+    clusters = publication_clusters(session)
     for rel, passage, doc in relations:
+        from .agreement import passage_agreement_ready
+        if not passage_agreement_ready(session, passage.id):
+            continue
         current, anchors = certified_anchors(session, passage.id)
         if not current or current != rel.certification_key:
             continue
@@ -119,7 +117,8 @@ def reviewed_relations(session: Session) -> list[dict]:
                 and max(source.end, dest.end) <= rel.evidence_end <= len(passage.text)):
             raise ValueError("Relação curada possui evidência com offsets inconsistentes")
         rows.append({
-            "relation_id": rel.id, "document_sha256": doc.sha256, "publication_sha256": publication_hash(doc.doi), "passage_id": passage.id,
+            "relation_id": rel.id, "document_sha256": doc.sha256, "publication_sha256": publication_hash(doc.doi),
+            "publication_group": clusters[doc.id], "passage_id": passage.id,
             "text": passage.text, "passage_sha256": digest(passage.text.encode("utf-8")),
             "subject": (source.start, source.end), "object": (dest.start, dest.end),
             "type": rel.relation_type, "evidence": (rel.evidence_start, rel.evidence_end),
@@ -149,6 +148,8 @@ def grouped_splits(rows: list[dict], seed: int) -> dict[str, str]:
         signatures = [("passage", row["passage_sha256"])]
         if row.get("publication_sha256"):
             signatures.append(("doi", row["publication_sha256"]))
+        if row.get("publication_group"):
+            signatures.append(("adjudicated_publication", row["publication_group"]))
         for signature in signatures:
             if signature in first:
                 union(row["document_sha256"], first[signature])
@@ -268,7 +269,8 @@ def train_relations(session: Session, out_dir: Path, *, epochs: int = 2, seed: i
     torch.save(model.state_dict(), weights)
     tok.save(out_dir / "tokenizer.json")
     snapshot = [{
-        "document_sha256": r["document_sha256"], "publication_sha256": r["publication_sha256"], "passage_sha256": r["passage_sha256"],
+        "document_sha256": r["document_sha256"], "publication_sha256": r["publication_sha256"],
+        "publication_group": r["publication_group"], "passage_sha256": r["passage_sha256"],
         "passage_id": r["passage_id"], "relation_id": r["relation_id"],
         "relation_type": r["type"], "label": r["label"],
         "subject": r["subject"], "object": r["object"], "evidence": r["evidence"],

@@ -16,6 +16,9 @@ import torch
 import torch.nn.functional as F
 
 from .curation import annotations_for
+from .bibliography import publication_clusters
+from .adjudication import unresolved_count
+
 from .db import Document, Passage, PassageReview
 from .model import BiaTagger, ENTITY_LABELS, LABELS, ModelConfig
 from .tokenizer import CharTokenizer
@@ -35,7 +38,13 @@ def source_dataset(session) -> list[dict]:
         .order_by(Document.sha256, Passage.page, Passage.id)
     ).all()
     rows = []
+    groups = publication_clusters(session)
     for doc, passage, review in records:
+        if unresolved_count(session, passage.id):
+            raise ValueError("Trecho certificado ainda possui divergências não adjudicadas")
+        from .agreement import passage_agreement_ready
+        if not passage_agreement_ready(session, passage.id):
+            raise ValueError("Trecho possui revisão cega de concordância pendente ou discordante")
         annotations = annotations_for(session, passage.id)
         if any(a.status == "pending" for a in annotations):
             raise ValueError("Trecho certificado contém anotações pendentes")
@@ -44,7 +53,7 @@ def source_dataset(session) -> list[dict]:
             key=lambda a: (a["start"], a["end"], a["label"]),
         )
         rows.append({
-            "document_id": doc.id, "sha256": doc.sha256, "passage_id": passage.id,
+            "document_id": doc.id, "sha256": doc.sha256, "publication_group": groups[doc.id], "passage_id": passage.id,
             "page": passage.page, "text": passage.text, "annotations": approved,
             "submitted_by": review.submitted_by, "certified_by": review.certified_by,
         })
@@ -54,13 +63,20 @@ def source_dataset(session) -> list[dict]:
 def document_splits(rows: list[dict]) -> dict[str, str]:
     """Holdouts determinísticos agrupados por documento, não por trecho."""
     docs = sorted({item["sha256"] for item in rows})
+    # Mesmo artigo (DOI ou adjudicação bibliográfica) não cruza o holdout.
+    # Fallback individual mantém compatibilidade com datasets antigos.
+    clusters: dict[str, set[str]] = {}
+    for item in rows:
+        clusters.setdefault(item.get("publication_group") or item["sha256"], set()).add(item["sha256"])
+    groups = sorted((sorted(members) for members in clusters.values()), key=lambda g: g[0])
     rng = random.Random(101)
-    rng.shuffle(docs)
-    if len(docs) < 3:
+    rng.shuffle(groups)
+    if len(groups) < 3:
         return {key: "train" for key in docs}
-    n_test = max(1, len(docs) // 10)
-    n_val = max(1, len(docs) // 10)
-    return {key: ("test" if i < n_test else "val" if i < n_test + n_val else "train") for i, key in enumerate(docs)}
+    n_test = max(1, len(groups) // 10)
+    n_val = max(1, len(groups) // 10)
+    return {doc: ("test" if i < n_test else "val" if i < n_test + n_val else "train")
+            for i, group in enumerate(groups) for doc in group}
 
 
 def build_samples(rows: list[dict], tokenizer: CharTokenizer, max_length: int):
@@ -180,7 +196,7 @@ def train(session, out_dir: Path, *, epochs: int = 2, seed: int = 42, config_ove
     torch.save(model.state_dict(), weights)
     tokenizer.save(out_dir / "tokenizer.json")
     snapshot = [{
-        "document_sha256": item["sha256"], "passage_id": item["passage_id"], "page": item["page"],
+        "document_sha256": item["sha256"], "publication_group": item["publication_group"], "passage_id": item["passage_id"], "page": item["page"],
         "passage_sha256": _hash(item["text"].encode()), "split": split_map[item["sha256"]],
         "annotations": item["annotations"], "submitted_by": item["submitted_by"],
         "certified_by": item["certified_by"],

@@ -5,7 +5,7 @@ import os
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, create_engine
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
 
@@ -146,3 +146,74 @@ class RelationNegativeAssessment(Base):
     assessed_by: Mapped[str] = mapped_column(String(128), nullable=False)
     reason: Mapped[str] = mapped_column(String(32), nullable=False, default="relation_absent")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+class AnnotationDispute(Base):
+    """Duas propostas independentes, adjudicação por terceira identidade.
+
+    Registro imutável de alternativas; após resolução guarda a anotação criada,
+    quando aplicável. Casos abertos bloqueiam a certificação integral do trecho.
+    """
+    __tablename__ = "annotation_disputes"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    passage_id: Mapped[str] = mapped_column(ForeignKey("passages.id"), nullable=False, index=True)
+    first_actor: Mapped[str] = mapped_column(String(128), nullable=False)
+    first_label: Mapped[str] = mapped_column(String(32), nullable=False)
+    first_start: Mapped[int] = mapped_column(Integer, nullable=False)
+    first_end: Mapped[int] = mapped_column(Integer, nullable=False)
+    second_actor: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    second_label: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    second_start: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    second_end: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="awaiting_second")
+    adjudicated_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    resolution: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    annotation_id: Mapped[str | None] = mapped_column(ForeignKey("annotations.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class BibliographicDecision(Base):
+    """Decisão única por par; nunca sobrescrita ou mesclagem das fontes."""
+    __tablename__ = "bibliographic_decisions"
+    __table_args__ = (UniqueConstraint("left_document_id", "right_document_id", name="uq_bibliography_pair"),)
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    left_document_id: Mapped[str] = mapped_column(ForeignKey("documents.id"), nullable=False, index=True)
+    right_document_id: Mapped[str] = mapped_column(ForeignKey("documents.id"), nullable=False, index=True)
+    verdict: Mapped[str] = mapped_column(String(32), nullable=False)
+    reviewed_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    reason: Mapped[str] = mapped_column(String(500), nullable=False)
+    reviewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class AgreementTask(Base):
+    """Intervalo e dupla fixados antes das observações; nenhuma escolha de classe pré-preenchida."""
+    __tablename__ = "agreement_tasks"
+    __table_args__ = (UniqueConstraint("passage_id", "start", "end", "rater_a", "rater_b", name="uq_agreement_assignment"),)
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    passage_id: Mapped[str] = mapped_column(ForeignKey("passages.id"), nullable=False, index=True)
+    start: Mapped[int] = mapped_column(Integer, nullable=False)
+    end: Mapped[int] = mapped_column(Integer, nullable=False)
+    rater_a: Mapped[str] = mapped_column(String(128), nullable=False)
+    rater_b: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class AgreementVote(Base):
+    __tablename__ = "agreement_votes"
+    __table_args__ = (UniqueConstraint("task_id", "actor", name="uq_agreement_vote_actor"),)
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    task_id: Mapped[str] = mapped_column(ForeignKey("agreement_tasks.id"), nullable=False, index=True)
+    actor: Mapped[str] = mapped_column(String(128), nullable=False)
+    label: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class AgreementResolution(Base):
+    __tablename__ = "agreement_resolutions"
+    task_id: Mapped[str] = mapped_column(ForeignKey("agreement_tasks.id"), primary_key=True)
+    actor: Mapped[str] = mapped_column(String(128), nullable=False)
+    label: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason: Mapped[str] = mapped_column(String(500), nullable=False)
+    resolved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)

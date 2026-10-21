@@ -5,6 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .db import Annotation, PassageReview
+from .adjudication import unresolved_count
 
 
 def annotations_for(session: Session, passage_id: str) -> list[Annotation]:
@@ -29,4 +30,5 @@ def review_state(session: Session, passage_id: str) -> dict:
         "approved_annotations": sum(a.status == "approved" for a in annotations),
         "pending_annotations": sum(a.status == "pending" for a in annotations),
         "rejected_annotations": sum(a.status == "rejected" for a in annotations),
+        "unresolved_disputes": unresolved_count(session, passage_id),
     }

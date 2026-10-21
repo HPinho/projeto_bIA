@@ -25,6 +25,10 @@ from bia_core.relations import (MAX_EVIDENCE_CHARS, RELATION_SIGNATURES, candida
 from bia_core.training import extract, train
 from bia_core.relation_learning import train_relations, predict_candidates
 from bia_core.evaluation import verified_report
+from bia_core.adjudication import validate_alternative, has_overlap, unresolved_count, dispute_record
+from bia_core.bibliography import normalize_doi, signals, ordered_pair, publication_clusters
+from bia_core.db import AnnotationDispute, BibliographicDecision, AgreementTask, AgreementVote, AgreementResolution
+from bia_core.agreement import AGREEMENT_LABELS, agreement_report, task_state, votes_for, gold_snapshot
 
 ROLES = ("viewer", "researcher", "curator", "admin")
 ALLOWED_RIGHTS = ("open_access", "author_permission", "institutional_permission")
@@ -57,6 +61,45 @@ class RelationProposal(BaseModel):
     ]
     evidence_start: int = Field(ge=0)
     evidence_end: int = Field(gt=0)
+
+
+class Alternative(BaseModel):
+    label: Literal["MATERIAL", "PROCESS", "PROPERTY", "QUANTITY", "UNIT", "CONDITION", "APPLICATION"]
+    start: int = Field(ge=0)
+    end: int = Field(gt=0)
+
+
+class OpenDispute(BaseModel):
+    passage_id: str
+    alternative: Alternative
+
+
+class ResolveDispute(BaseModel):
+    resolution: Literal["first", "second", "neither"]
+    reason: str = Field(min_length=10, max_length=500)
+
+
+class BibliographyVerdict(BaseModel):
+    left_document_id: str
+    right_document_id: str
+    verdict: Literal["same_publication", "distinct_publication"]
+    reason: str = Field(min_length=10, max_length=500)
+
+
+class NewAgreementTask(BaseModel):
+    passage_id: str
+    start: int = Field(ge=0)
+    end: int = Field(gt=0)
+    rater_a: str = Field(min_length=1, max_length=128)
+    rater_b: str = Field(min_length=1, max_length=128)
+
+
+class AgreementLabel(BaseModel):
+    label: Literal["MATERIAL", "PROCESS", "PROPERTY", "QUANTITY", "UNIT", "CONDITION", "APPLICATION", "NONE"]
+
+
+class AgreementAdjudication(AgreementLabel):
+    reason: str = Field(min_length=10, max_length=500)
 
 
 class TrainRequest(BaseModel):
@@ -128,8 +171,8 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
             raise HTTPException(422, "Defina uma base de direitos permitida")
         if not 1 <= len(title.strip()) <= 500 or year is not None and not 1500 <= year <= 2100:
             raise HTTPException(422, "Título ou ano inválido")
-        if doi and len(doi) > 255:
-            raise HTTPException(422, "DOI excede o limite")
+        if doi and normalize_doi(doi) is None:
+            raise HTTPException(422, "DOI inválido; use o formato 10.xxxx/sufixo")
         maximum = int(os.getenv("BIA_MAX_PDF_BYTES", "20971520"))
         if maximum <= 0 or maximum > 100 * 1024 * 1024:
             raise HTTPException(500, "Limite de upload mal configurado")
@@ -147,7 +190,7 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
         document_path = storage / f"{digest}.pdf"
         # No uploaded filename is ever used for filesystem paths.
         document_path.write_bytes(contents)
-        document = Document(title=title.strip(), doi=doi.strip() if doi else None, year=year,
+        document = Document(title=title.strip(), doi=normalize_doi(doi) if doi else None, year=year,
                             rights_basis=rights_basis, training_allowed=training_allowed,
                             sha256=digest, asset_path=str(document_path),
                             status="ready" if any(text.strip() for _, text in pages) else "needs_review")
@@ -214,6 +257,7 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
         passage = session.get(Passage, passage_id)
         if passage is None:
             raise HTTPException(404, "Trecho não encontrado")
+        get_doc(session, passage.document_id, user)
         items = annotations_for(session, passage_id)
         return [{"id": a.id, "label": a.label, "start": a.start, "end": a.end,
                  "quote": passage.text[a.start:a.end], "status": a.status, "actor": a.actor,
@@ -224,6 +268,8 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
         annotation = session.get(Annotation, annotation_id)
         if annotation is None:
             raise HTTPException(404, "Anotação não encontrada")
+        passage = session.get(Passage, annotation.passage_id)
+        get_doc(session, passage.document_id, user)
         if review_state(session, annotation.passage_id)["status"] != "draft":
             raise HTTPException(409, "Trecho submetido ou certificado; reabra antes de modificar")
         if annotation.status != "pending":
@@ -256,6 +302,8 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
         passages = session.scalars(select(Passage)).all()
         states = {"draft": 0, "submitted": 0, "certified": 0}
         eligible = 0
+        open_disputes = sum(1 for case in session.scalars(select(AnnotationDispute)).all() if case.status != "resolved")
+        bibliography_decisions = len(session.scalars(select(BibliographicDecision.id)).all())
         allowed = {d.id for d in documents if d.training_allowed}
         for passage in passages:
             status = reviews.get(passage.id, "draft")
@@ -266,6 +314,7 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
             "documents": len(documents), "training_authorized_documents": len(allowed),
             "passages": len(passages), "passages_by_state": states,
             "training_eligible_passages": eligible,
+            "open_adjudications": open_disputes, "bibliographic_pairs_reviewed": bibliography_decisions,
             "scientifically_validated": False,
         }
 
@@ -278,8 +327,8 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
         state = review_state(session, passage_id)
         if state["status"] != "draft":
             raise HTTPException(409, "Trecho já submetido ou certificado")
-        if state["pending_annotations"]:
-            raise HTTPException(409, "Revise todas as anotações pendentes antes de submeter")
+        if state["pending_annotations"] or state["unresolved_disputes"]:
+            raise HTTPException(409, "Resolva anotações pendentes e divergências antes de submeter")
         review = session.get(PassageReview, passage_id)
         if review is None:
             review = PassageReview(passage_id=passage_id, submitted_by=user["actor"])
@@ -305,8 +354,9 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
             raise HTTPException(409, "Trecho ainda não foi submetido")
         if review.submitted_by == user["actor"]:
             raise HTTPException(403, "Certificação exige um segundo pesquisador")
-        if review_state(session, passage_id)["pending_annotations"]:
-            raise HTTPException(409, "Ainda existem anotações pendentes")
+        state = review_state(session, passage_id)
+        if state["pending_annotations"] or state["unresolved_disputes"]:
+            raise HTTPException(409, "Existem anotações ou divergências pendentes")
         review.status = "certified"
         review.certified_by = user["actor"]
         review.certified_at = now()
@@ -329,6 +379,144 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
         audit(session, user, "passage.review.reopen", passage_id)
         session.commit()
         return review_state(session, passage_id)
+
+    @app.post("/v1/adjudications", status_code=201)
+    def open_dispute(data: OpenDispute, user: dict = Depends(role("curator", "admin")),
+                     session: Session = Depends(db)):
+        passage = session.get(Passage, data.passage_id)
+        if passage is None:
+            raise HTTPException(404, "Trecho não encontrado")
+        get_doc(session, passage.document_id, user)
+        if review_state(session, passage.id)["status"] != "draft":
+            raise HTTPException(409, "Reabra o trecho antes de registrar divergências")
+        try:
+            validate_alternative(passage, data.alternative.label, data.alternative.start, data.alternative.end)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        case = AnnotationDispute(passage_id=passage.id, first_actor=user["actor"],
+            first_label=data.alternative.label, first_start=data.alternative.start,
+            first_end=data.alternative.end)
+        session.add(case)
+        session.flush()
+        audit(session, user, "adjudication.open", case.id)
+        session.commit()
+        return dispute_record(case, passage)
+
+    @app.post("/v1/adjudications/{case_id}/second")
+    def second_opinion(case_id: str, data: Alternative,
+                       user: dict = Depends(role("curator", "admin")), session: Session = Depends(db)):
+        case = session.get(AnnotationDispute, case_id)
+        if case is None:
+            raise HTTPException(404, "Divergência não encontrada")
+        passage = session.get(Passage, case.passage_id)
+        get_doc(session, passage.document_id, user)
+        if case.status != "awaiting_second" or review_state(session, passage.id)["status"] != "draft":
+            raise HTTPException(409, "Divergência não aceita segunda opinião")
+        if user["actor"] == case.first_actor:
+            raise HTTPException(403, "A segunda opinião exige outro pesquisador")
+        try:
+            validate_alternative(passage, data.label, data.start, data.end)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        case.second_actor = user["actor"]
+        case.second_label, case.second_start, case.second_end = data.label, data.start, data.end
+        case.status = "awaiting_adjudication"
+        audit(session, user, "adjudication.second", case.id)
+        session.commit()
+        return dispute_record(case, passage)
+
+    @app.post("/v1/adjudications/{case_id}/resolve")
+    def resolve_dispute(case_id: str, data: ResolveDispute,
+                        user: dict = Depends(role("curator", "admin")), session: Session = Depends(db)):
+        case = session.get(AnnotationDispute, case_id)
+        if case is None:
+            raise HTTPException(404, "Divergência não encontrada")
+        passage = session.get(Passage, case.passage_id)
+        get_doc(session, passage.document_id, user)
+        if case.status != "awaiting_adjudication" or review_state(session, passage.id)["status"] != "draft":
+            raise HTTPException(409, "Divergência não está pronta para adjudicação")
+        if user["actor"] in (case.first_actor, case.second_actor):
+            raise HTTPException(403, "A adjudicação exige terceira identidade independente")
+        if data.resolution != "neither":
+            actor, label, start, end = ((case.first_actor, case.first_label, case.first_start, case.first_end)
+                if data.resolution == "first" else
+                (case.second_actor, case.second_label, case.second_start, case.second_end))
+            if has_overlap(session, passage.id, start, end):
+                raise HTTPException(409, "Anotação conflita com outra existente; resolva-a antes")
+            selected = Annotation(passage_id=passage.id, label=label, start=start, end=end,
+                                  actor=actor, status="approved", reviewer=user["actor"], reviewed_at=now())
+            session.add(selected)
+            session.flush()
+            case.annotation_id = selected.id
+        case.status = "resolved"
+        case.resolution = data.resolution
+        case.reason = data.reason.strip()
+        case.adjudicated_by = user["actor"]
+        case.resolved_at = now()
+        audit(session, user, "adjudication.resolve." + data.resolution, case.id)
+        session.commit()
+        return dispute_record(case, passage)
+
+    @app.get("/v1/passages/{passage_id}/adjudications")
+    def list_adjudications(passage_id: str, user: dict = Depends(role("curator", "admin")),
+                           session: Session = Depends(db)):
+        passage = session.get(Passage, passage_id)
+        if passage is None:
+            raise HTTPException(404, "Trecho não encontrado")
+        get_doc(session, passage.document_id, user)
+        cases = session.scalars(select(AnnotationDispute).where(
+            AnnotationDispute.passage_id == passage_id).order_by(AnnotationDispute.created_at, AnnotationDispute.id)).all()
+        return {"passage_id": passage_id, "unresolved": unresolved_count(session, passage_id),
+                "cases": [dispute_record(c, passage) for c in cases]}
+
+    @app.get("/v1/documents/{document_id}/duplicates")
+    def possible_duplicates(document_id: str, user: dict = Depends(role("curator", "admin")),
+                            session: Session = Depends(db)):
+        document = get_doc(session, document_id, user)
+        candidates = []
+        for other in session.scalars(select(Document).where(Document.id != document_id).order_by(Document.id)):
+            if not visible(other, user):
+                continue
+            match = signals(document, other)
+            if not match:
+                continue
+            a, b = ordered_pair(document.id, other.id)
+            decision = session.scalar(select(BibliographicDecision).where(
+                BibliographicDecision.left_document_id == a, BibliographicDecision.right_document_id == b))
+            candidates.append({"document_id": other.id, "title": other.title, "doi": other.doi,
+                "year": other.year, "signals": match,
+                "verdict": decision.verdict if decision else "unreviewed",
+                "reviewed_by": decision.reviewed_by if decision else None})
+        return {"document_id": document_id, "candidates": candidates, "automatically_merged": False}
+
+    @app.post("/v1/bibliography/review")
+    def review_bibliography(data: BibliographyVerdict,
+                            user: dict = Depends(role("curator", "admin")), session: Session = Depends(db)):
+        try:
+            a, b = ordered_pair(data.left_document_id, data.right_document_id)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        left, right = get_doc(session, a, user), get_doc(session, b, user)
+        if not signals(left, right):
+            raise HTTPException(422, "Sem sinais bibliográficos; encaminhe para revisão manual externa")
+        # Revisão independente de quem cadastrou os PDFs; evita autocertificação.
+        uploaders = session.scalars(select(AuditEvent.actor).where(
+            AuditEvent.action == "document.upload", AuditEvent.resource.in_((a, b)))).all()
+        if user["actor"] in uploaders:
+            raise HTTPException(403, "A decisão bibliográfica exige revisor distinto do responsável pela ingestão")
+        existing = session.scalar(select(BibliographicDecision).where(
+            BibliographicDecision.left_document_id == a,
+            BibliographicDecision.right_document_id == b))
+        if existing:
+            raise HTTPException(409, "Par já decidido; preservamos a decisão e a trilha de auditoria")
+        decision = BibliographicDecision(left_document_id=a, right_document_id=b,
+            verdict=data.verdict, reviewed_by=user["actor"], reason=data.reason.strip())
+        session.add(decision)
+        audit(session, user, "bibliography.review." + data.verdict, a + ":" + b)
+        session.commit()
+        return {"id": decision.id, "left_document_id": a, "right_document_id": b,
+                "verdict": decision.verdict, "automatically_merged": False,
+                "training_group_id": publication_clusters(session)[a]}
 
     @app.get("/v1/passages/{passage_id}/relation-candidates")
     def relation_candidates(passage_id: str, user: dict = Depends(role("curator", "admin")),
@@ -552,6 +740,126 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
         return {**base, "status": "experimental_unverified", "model_run_id": run.id,
                 "warning": "Escore não calibrado: nenhuma relação é aprovada automaticamente",
                 "candidates": ranked}
+
+    @app.post("/v1/agreement/tasks", status_code=201)
+    def new_agreement_task(data: NewAgreementTask,
+                           user: dict = Depends(role("curator", "admin")), session: Session = Depends(db)):
+        passage = session.get(Passage, data.passage_id)
+        if passage is None:
+            raise HTTPException(404, "Trecho não encontrado")
+        get_doc(session, passage.document_id, user)
+        if not 0 <= data.start < data.end <= len(passage.text) or not passage.text[data.start:data.end].strip():
+            raise HTTPException(422, "Offsets da amostra inválidos")
+        a, b = data.rater_a.strip(), data.rater_b.strip()
+        if a == b or not a or not b:
+            raise HTTPException(422, "São necessárias duas identidades diferentes")
+        # Não é permitido criar tarefas destinadas a identidades que não possuem
+        # permissão de curadoria configurada para esta instância.
+        configured = {profile.get("actor") for profile in key_config.values()
+                      if isinstance(profile, dict) and profile.get("role") in ("curator", "admin")}
+        if a not in configured or b not in configured:
+            raise HTTPException(422, "Revisores precisam possuir credenciais de curadoria válidas")
+        a, b = sorted((a, b))
+        existing = session.scalar(select(AgreementTask).where(
+            AgreementTask.passage_id == passage.id, AgreementTask.start == data.start,
+            AgreementTask.end == data.end, AgreementTask.rater_a == a, AgreementTask.rater_b == b))
+        if existing:
+            raise HTTPException(409, "Amostra já atribuída a esta dupla; não substituímos respostas")
+        task = AgreementTask(passage_id=passage.id, start=data.start, end=data.end,
+                             rater_a=a, rater_b=b, created_by=user["actor"])
+        session.add(task)
+        session.flush()
+        audit(session, user, "agreement.task.create", task.id)
+        session.commit()
+        return {**task_state(session, task), "quote": passage.text[task.start:task.end]}
+
+    @app.get("/v1/agreement/tasks")
+    def list_agreement_tasks(passage_id: str | None = None,
+                             user: dict = Depends(role("curator", "admin")), session: Session = Depends(db)):
+        statement = select(AgreementTask).order_by(AgreementTask.created_at.desc(), AgreementTask.id.desc()).limit(100)
+        if passage_id is not None:
+            passage = session.get(Passage, passage_id)
+            if passage is None:
+                raise HTTPException(404, "Trecho não encontrado")
+            get_doc(session, passage.document_id, user)
+            statement = statement.where(AgreementTask.passage_id == passage_id)
+        tasks = []
+        for task in session.scalars(statement):
+            if user["role"] != "admin" and user["actor"] not in (task.rater_a, task.rater_b):
+                continue
+            passage = session.get(Passage, task.passage_id)
+            document = session.get(Document, passage.document_id)
+            if not visible(document, user):
+                continue
+            tasks.append({**task_state(session, task, reveal=True), "quote": passage.text[task.start:task.end]})
+        return {"tasks": tasks, "has_more_possible": len(tasks) == 100}
+
+    @app.get("/v1/agreement/tasks/{task_id}")
+    def agreement_task_details(task_id: str, user: dict = Depends(role("curator", "admin")),
+                               session: Session = Depends(db)):
+        task = session.get(AgreementTask, task_id)
+        if task is None:
+            raise HTTPException(404, "Amostra não encontrada")
+        passage = session.get(Passage, task.passage_id)
+        get_doc(session, passage.document_id, user)
+        if user["role"] != "admin" and user["actor"] not in (task.rater_a, task.rater_b):
+            raise HTTPException(403, "Amostra destinada a outra dupla")
+        # Antes dos dois votos ninguém vê a escolha do outro, nem o admin.
+        return {**task_state(session, task, reveal=True), "quote": passage.text[task.start:task.end]}
+
+    @app.post("/v1/agreement/tasks/{task_id}/vote")
+    def submit_agreement_vote(task_id: str, data: AgreementLabel,
+                              user: dict = Depends(role("curator", "admin")), session: Session = Depends(db)):
+        task = session.get(AgreementTask, task_id)
+        if task is None:
+            raise HTTPException(404, "Amostra não encontrada")
+        passage = session.get(Passage, task.passage_id)
+        get_doc(session, passage.document_id, user)
+        if user["actor"] not in (task.rater_a, task.rater_b):
+            raise HTTPException(403, "Apenas revisores designados podem votar")
+        if user["actor"] in votes_for(session, task_id):
+            raise HTTPException(409, "Voto já registrado; observações independentes são imutáveis")
+        if session.get(AgreementResolution, task_id):
+            raise HTTPException(409, "Amostra já adjudicada")
+        session.add(AgreementVote(task_id=task.id, actor=user["actor"], label=data.label))
+        audit(session, user, "agreement.vote", task.id)
+        session.commit()
+        # resposta não inclui votos — mantenha cegamento até conclusão.
+        return task_state(session, task)
+
+    @app.post("/v1/agreement/tasks/{task_id}/adjudicate")
+    def adjudicate_agreement(task_id: str, data: AgreementAdjudication,
+                             user: dict = Depends(role("curator", "admin")), session: Session = Depends(db)):
+        task = session.get(AgreementTask, task_id)
+        if task is None:
+            raise HTTPException(404, "Amostra não encontrada")
+        passage = session.get(Passage, task.passage_id)
+        get_doc(session, passage.document_id, user)
+        if user["actor"] in (task.rater_a, task.rater_b):
+            raise HTTPException(403, "Decisão final exige terceira identidade")
+        state = task_state(session, task, reveal=True)
+        if not state["complete"] or not state["needs_adjudication"]:
+            raise HTTPException(409, "Somente discordâncias completas e pendentes são adjudicáveis")
+        session.add(AgreementResolution(task_id=task.id, actor=user["actor"],
+                                        label=data.label, reason=data.reason.strip()))
+        audit(session, user, "agreement.adjudicate", task.id)
+        session.commit()
+        return task_state(session, task, reveal=True)
+
+    @app.get("/v1/agreement/metrics")
+    def agreement_metrics(user: dict = Depends(role("admin",)), session: Session = Depends(db)):
+        return agreement_report(session)
+
+    @app.get("/v1/datasets/gold/export")
+    def export_gold(user: dict = Depends(role("admin",)), session: Session = Depends(db)):
+        try:
+            snapshot = gold_snapshot(session)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        # Payload restrito a admin; o conteúdo pode conter material institucional.
+        audit(session, user, "gold.export", snapshot["sha256"])
+        session.commit()
+        return snapshot
 
     def run_training(run_id: str, epochs: int, seed: int):
         with job_lock, session_factory() as session:
