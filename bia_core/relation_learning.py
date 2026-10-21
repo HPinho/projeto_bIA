@@ -19,6 +19,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from .db import Document, Passage, ScientificRelation, RelationNegativeAssessment
+from .evaluation import build_evaluation_report
 from .model import Block, ModelConfig
 from .relations import RELATION_SIGNATURES, certified_anchors
 from .tokenizer import CharTokenizer
@@ -75,6 +76,19 @@ class BiaRelationClassifier(nn.Module):
         return self.output(torch.cat([context, source, dest, relation], dim=-1))
 
 
+def publication_hash(doi: str | None) -> str | None:
+    """Versões de um artigo com mesmo DOI devem permanecer no mesmo split."""
+    if not doi or not doi.strip():
+        return None
+    normalized = doi.strip().lower()
+    for prefix in ("https://doi.org/", "http://doi.org/", "http://dx.doi.org/", "https://dx.doi.org/", "doi:"):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix):]
+            break
+    normalized = normalized.strip()
+    return digest(normalized.encode("utf-8")) if normalized else None
+
+
 def reviewed_relations(session: Session) -> list[dict]:
     """Rejeitado significa negativo explícito para AQUELE predicado/direção."""
     relations = session.execute(
@@ -105,7 +119,7 @@ def reviewed_relations(session: Session) -> list[dict]:
                 and max(source.end, dest.end) <= rel.evidence_end <= len(passage.text)):
             raise ValueError("Relação curada possui evidência com offsets inconsistentes")
         rows.append({
-            "relation_id": rel.id, "document_sha256": doc.sha256, "passage_id": passage.id,
+            "relation_id": rel.id, "document_sha256": doc.sha256, "publication_sha256": publication_hash(doc.doi), "passage_id": passage.id,
             "text": passage.text, "passage_sha256": digest(passage.text.encode("utf-8")),
             "subject": (source.start, source.end), "object": (dest.start, dest.end),
             "type": rel.relation_type, "evidence": (rel.evidence_start, rel.evidence_end),
@@ -130,12 +144,15 @@ def grouped_splits(rows: list[dict], seed: int) -> dict[str, str]:
         a, b = find(x), find(y)
         parent[max(a, b)] = min(a, b)
 
-    first: dict[str, str] = {}
+    first: dict[tuple[str, str], str] = {}
     for row in rows:
-        signature = row["passage_sha256"]
-        if signature in first:
-            union(row["document_sha256"], first[signature])
-        first[signature] = row["document_sha256"]
+        signatures = [("passage", row["passage_sha256"])]
+        if row.get("publication_sha256"):
+            signatures.append(("doi", row["publication_sha256"]))
+        for signature in signatures:
+            if signature in first:
+                union(row["document_sha256"], first[signature])
+            first[signature] = row["document_sha256"]
     groups: dict[str, list[str]] = {}
     for doc in documents:
         groups.setdefault(find(doc), []).append(doc)
@@ -220,34 +237,28 @@ def train_relations(session: Session, out_dir: Path, *, epochs: int = 2, seed: i
             optim.step()
             losses.append(float(loss.detach()))
     model.eval()
-    tp = fp = fn = 0
-    val_count = 0
-    by_type = {name: {"tp": 0, "fp": 0, "fn": 0, "total": 0} for name in RELATION_TYPES}
+    predictions: list[dict] = []
     with torch.inference_mode():
         for row, ids, subj, dest, kind in prepared:
-            if assignments[row["document_sha256"]] != "val":
+            split = assignments[row["document_sha256"]]
+            if split not in ("val", "test"):
                 continue
-            val_count += 1
-            guess = model(torch.tensor([ids]), subj, dest, kind).argmax(-1).item()
-            tp += int(guess == 1 and row["label"] == 1)
-            fp += int(guess == 1 and row["label"] == 0)
-            fn += int(guess == 0 and row["label"] == 1)
-            counts = by_type[row["type"]]
-            counts["total"] += 1
-            counts["tp"] += int(guess == 1 and row["label"] == 1)
-            counts["fp"] += int(guess == 1 and row["label"] == 0)
-            counts["fn"] += int(guess == 0 and row["label"] == 1)
+            logits = model(torch.tensor([ids]), subj, dest, kind)
+            predictions.append({
+                "split": split, "relation_id": row["relation_id"],
+                "document_sha256": row["document_sha256"], "passage_sha256": row["passage_sha256"],
+                "relation_type": row["type"], "label": row["label"],
+                "prediction": int(logits.argmax(-1).item()),
+                "score_uncalibrated": float(F.softmax(logits, dim=-1)[0, 1].item()),
+            })
     metrics = {
         "total_reviewed": len(rows),
         "train_examples": sum(assignments[r["document_sha256"]] == "train" for r in rows),
-        "validation_examples": val_count,
+        "validation_examples": sum(assignments[r["document_sha256"]] == "val" for r in rows),
         "test_examples": sum(assignments[r["document_sha256"]] == "test" for r in rows),
         "train_positive": sum(r["label"] == 1 for r in training),
         "train_negative_explicit": sum(r["label"] == 0 for r in training),
         "last_train_loss": losses[-1],
-        "validation": _rates(tp, fp, fn, val_count),
-        "validation_by_type": {name: {"examples": counts["total"], **_rates(counts["tp"], counts["fp"], counts["fn"], counts["total"])}
-                               for name, counts in by_type.items()},
         "scientifically_validated": False,
         "note": "Predição experimental binária, sem calibração; rejeições explícitas não equivalem a negativos de outros predicados.",
     }
@@ -257,7 +268,7 @@ def train_relations(session: Session, out_dir: Path, *, epochs: int = 2, seed: i
     torch.save(model.state_dict(), weights)
     tok.save(out_dir / "tokenizer.json")
     snapshot = [{
-        "document_sha256": r["document_sha256"], "passage_sha256": r["passage_sha256"],
+        "document_sha256": r["document_sha256"], "publication_sha256": r["publication_sha256"], "passage_sha256": r["passage_sha256"],
         "passage_id": r["passage_id"], "relation_id": r["relation_id"],
         "relation_type": r["type"], "label": r["label"],
         "subject": r["subject"], "object": r["object"], "evidence": r["evidence"],
@@ -266,9 +277,19 @@ def train_relations(session: Session, out_dir: Path, *, epochs: int = 2, seed: i
     } for r in rows]
     snap = out_dir / "dataset_snapshot.json"
     snap.write_text(json.dumps(snapshot, sort_keys=True, indent=2, ensure_ascii=False), encoding="utf-8")
+    dataset_sha = digest(snap.read_bytes())
+    evaluation = build_evaluation_report(predictions, relation_types=RELATION_TYPES,
+                                         assignments=assignments, dataset_sha256=dataset_sha)
+    metrics["validation"] = evaluation["validation"]["overall"]
+    metrics["validation_by_type"] = evaluation["validation"]["by_type"]
+    metrics["test"] = evaluation["test"]["overall"]
+    metrics["holdout_evaluable"] = evaluation["test"]["evaluable"]
+    report_path = out_dir / "evaluation_report.json"
+    report_path.write_text(json.dumps(evaluation, sort_keys=True, indent=2, ensure_ascii=False), encoding="utf-8")
     manifest = {"architecture": "bia-relation-char-transformer", "config": asdict(conf),
                 "relation_types": RELATION_TYPES, "epochs": epochs, "seed": seed,
-                "metrics": metrics, "dataset_sha256": digest(snap.read_bytes()),
+                "metrics": metrics, "dataset_sha256": dataset_sha, "evaluation_schema_version": 1,
+                "evaluation_sha256": digest(report_path.read_bytes()),
                 "weights_sha256": digest(weights.read_bytes()),
                 "tokenizer_sha256": digest((out_dir / "tokenizer.json").read_bytes())}
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")

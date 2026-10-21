@@ -25,6 +25,7 @@ export default function Research() {
   const [predictions, setPredictions] = useState<PredictedRelation[]>([]);
   const [relationRunId, setRelationRunId] = useState('');
   const [relationRunStatus, setRelationRunStatus] = useState('');
+  const [relationEvaluation, setRelationEvaluation] = useState<{ dataset_sha256: string; scientifically_validated: boolean; documents: Record<string, number>; validation: { overall: { examples: number; f1: number | null }; errors: { kind: string; relation_type: string }[] }; test: { overall: { examples: number; f1: number | null }; errors: { kind: string; relation_type: string }[] } } | null>(null);
   const [curatedRelations, setCuratedRelations] = useState<CuratedRelation[]>([]);
   const [relationResults, setRelationResults] = useState<VerifiedRelation[]>([]);
   const [relationQuery, setRelationQuery] = useState('celulose');
@@ -149,6 +150,14 @@ export default function Research() {
       setMessage(JSON.stringify({ status: run.status, metrics: run.metrics, error: run.error }, null, 2));
     });
   }
+  async function inspectRelationEvaluation() {
+    await exec(async () => {
+      if (!relationRunId) throw Error('Informe o ID do treinamento concluído.');
+      const report = await api('/v1/relation-models/runs/' + encodeURIComponent(relationRunId) + '/evaluation');
+      setRelationEvaluation(report);
+      setMessage('Avaliação experimental recuperada com verificação de integridade. Acesso somente de administrador.');
+    });
+  }
   async function predictRelations() {
     await exec(async () => {
       const query = relationRunId ? `?run_id=${encodeURIComponent(relationRunId)}` : '';
@@ -166,7 +175,7 @@ export default function Research() {
     });
   }
   return <main>
-    <header><span className="badge">Bloco 02.2 · Relações científicas com IA local</span><h1>bIA</h1><p className="muted">Inteligência de materiais com fontes verificáveis · modelo próprio · processamento local</p></header>
+    <header><span className="badge">Bloco 02.3 · Avaliação por publicação e IA local</span><h1>bIA</h1><p className="muted">Inteligência de materiais com fontes verificáveis · modelo próprio · processamento local</p></header>
     <section className="card stack"><h2>Conexão com o laboratório</h2><label>Token de acesso (somente memória desta aba)</label><input type="password" value={token} autoComplete="off" onChange={e => setToken(e.target.value)} placeholder="Bearer token configurado na API" /><small>Use tokens diferentes para criar e revisar anotações. Não utilize este protótipo publicamente sem autenticação institucional.</small></section>
     <section className="card"><h2>Importar documento científico autorizado</h2><form className="stack" onSubmit={upload}>
       <input required placeholder="Título do trabalho" value={title} onChange={e => setTitle(e.target.value)} />
@@ -206,8 +215,17 @@ export default function Research() {
           <div className="row"><button type="button" onClick={trainRelationModel}>Treinar modelo local (admin)</button>
             <input value={relationRunId} placeholder="ID do treinamento (opcional)" onChange={e => setRelationRunId(e.target.value)} />
             <button type="button" onClick={relationTrainingStatus}>Consultar treino</button>
+            <button type="button" onClick={inspectRelationEvaluation}>Avaliação (admin)</button>
             <button type="button" disabled={reviewState?.status !== 'certified'} onClick={predictRelations}>Ordenar sugestões com IA</button></div>
           {relationRunStatus && <p className="muted">Execução: {relationRunStatus}</p>}
+          {relationEvaluation && <article className="result">
+            <strong>Avaliação não calibrada e sem validação científica externa</strong>
+            <p className="muted">Dataset SHA-256: {relationEvaluation.dataset_sha256}</p>
+            <p>Publicações por conjunto: treino {relationEvaluation.documents.train} · validação {relationEvaluation.documents.validation} · teste {relationEvaluation.documents.test}</p>
+            <p>Validação: {relationEvaluation.validation.overall.examples} exemplos, F1 {relationEvaluation.validation.overall.f1?.toFixed(3) ?? 'indefinido'} · erros {relationEvaluation.validation.errors.length}</p>
+            <p>Teste isolado: {relationEvaluation.test.overall.examples} exemplos, F1 {relationEvaluation.test.overall.f1?.toFixed(3) ?? 'indefinido'} · erros {relationEvaluation.test.errors.length}</p>
+            <small>Ausência de dados suficientes significa métrica indefinida, não desempenho zero. Examinar erros não substitui avaliação externa dos INCTs.</small>
+          </article>}
           {predictions.map((r, idx) => <article className="result" key={`${r.relation_type}-${idx}`}>
             <strong>{r.relation_type}</strong> · escore não calibrado: {r.model_score_uncalibrated.toFixed(3)}
             <p>{r.evidence_quote}</p><small>Não verificada · requer revisão humana</small>

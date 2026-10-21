@@ -100,3 +100,13 @@ O novo classificador `bia_core/relation_learning.py` usa um Transformer próprio
 A avaliação preserva a divisão por documento e agrupa textos iguais entre estudos para prevenir vazamento óbvio de dados. Não há números de desempenho científico alegados enquanto não tivermos um corpus anotado e validado por especialistas. [Leia o protocolo completo BIA-02.2](docs/BLOCO_02_2_APRENDIZADO_RELACOES.md).
 
 **Próxima frente:** BIA-02.3 — dataset tripartite de relações e avaliação independente por estudo, com calibração e análise de erros.
+
+## Bloco 02.3 — Avaliação científica e reprodutibilidade auditável
+
+O relatório por publicação e tipo de relação separa **treino, validação e teste isolado**. O agrupamento agora reconhece versões de um mesmo artigo pelo DOI normalizado, além de passagens textualmente idênticas. Os resultados incluem matriz de confusão, precisão, recall, F1, macro-F1 para tipos mensuráveis e erros identificados por hashes/IDs, sem conteúdo integral dos documentos.
+
+O endpoint `GET /v1/relation-models/runs/{id}/evaluation` (somente administrador) verifica a integridade do manifesto, snapshot e relatório. O relatório é criado no diretório local da execução, acompanhado dos pesos e tokenizador. Métricas sem suporte são `null`; o teste isolado não é usado para ajuste de pesos ou seleção de hiperparâmetros.
+
+**Estado científico:** ainda não existe dataset de referência aprovado pelos três INCTs, e os testes unitários são sintéticos. A bIA não afirma desempenho real validado, nem converte escore neural em evidência científica.
+
+Leia [BIA-02.3 — Avaliação e protocolo científico](docs/BLOCO_02_3_AVALIACAO_CIENTIFICA.md). **Próxima frente: BIA-02.4 — adjudicação e deduplicação bibliográfica, incluindo duplicatas sem DOI.**

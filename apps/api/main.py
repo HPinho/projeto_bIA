@@ -24,6 +24,7 @@ from bia_core.relations import (MAX_EVIDENCE_CHARS, RELATION_SIGNATURES, candida
                                 certified_anchors, is_current, relation_record)
 from bia_core.training import extract, train
 from bia_core.relation_learning import train_relations, predict_candidates
+from bia_core.evaluation import verified_report
 
 ROLES = ("viewer", "researcher", "curator", "admin")
 ALLOWED_RIGHTS = ("open_access", "author_permission", "institutional_permission")
@@ -495,6 +496,24 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
         return {"id": run.id, "status": run.status,
                 "metrics": json.loads(run.metrics_json) if run.metrics_json else None,
                 "error": run.error}
+
+    @app.get("/v1/relation-models/runs/{run_id}/evaluation")
+    def relation_evaluation(run_id: str, user: dict = Depends(role("admin",)),
+                            session: Session = Depends(db)):
+        """Avaliação interna: ids/hashes de documentos e erros são restritos ao admin."""
+        run = session.get(RelationModelRun, run_id)
+        if run is None:
+            raise HTTPException(404, "Execução não encontrada")
+        if run.status != "completed" or not run.artifact_dir:
+            raise HTTPException(409, "A avaliação ainda não foi concluída")
+        folder = Path(run.artifact_dir).resolve()
+        if not folder.is_relative_to((root / "relations").resolve()) or folder.name != run.id:
+            raise HTTPException(409, "Diretório de avaliação não autorizado")
+        try:
+            report = verified_report(folder)
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            raise HTTPException(409, "Integridade da avaliação inválida") from None
+        return report
 
     @app.get("/v1/passages/{passage_id}/relation-predictions")
     def relation_predictions(passage_id: str, run_id: str | None = None,

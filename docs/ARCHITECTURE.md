@@ -46,3 +46,7 @@ Relações direcionais usam duas entidades aprovadas no mesmo trecho, offsets li
 ### BIA-02.2 — Módulo de aprendizado de relações
 
 `bia_core/relation_learning.py` adiciona classificador char-Transformer próprio, com pesos locais, entradas de offsets de sujeito/objeto e tipo do predicado. `RelationNegativeAssessment` guarda negativos **expressamente** confirmados como ausentes (rejeição genérica não vale como negativo). `RelationModelRun` isola jobs e artefatos do extrator NER. Predições são apenas hipóteses; não são importadas ao grafo verificado. Veja [protocolo BIA-02.2](BLOCO_02_2_APRENDIZADO_RELACOES.md). Próxima implementação: **BIA-02.3 — avaliação e versionamento de datasets científicos**.
+
+### BIA-02.3 — Avaliação por publicação e integridade de resultados
+
+O classificador de relações agora agrupa documentos com DOI normalizado idêntico e passagens idênticas nos mesmos splits. `bia_core/evaluation.py` calcula matriz de confusão, F1 por relação e documento, erros sem texto sensível e métricas `null` para suportes insuficientes. Artefato `evaluation_report.json` é vinculado ao dataset congelado via SHA-256 e consultável apenas por administradores após verificação dos hashes. Não existe validação científica em corpora reais nesta fase. Consultar [protocolo BIA-02.3](BLOCO_02_3_AVALIACAO_CIENTIFICA.md). Próxima frente: **BIA-02.4, adjudicação tripartite e duplicatas bibliográficas**.
