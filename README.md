@@ -133,3 +133,14 @@ A bIA agora possui tarefas de avaliação cega **por intervalo e dupla fixa**, v
 O pipeline de treino de entidades recusa amostras pendentes ou conflitantes; o treino de relações também não usa essas amostras. A decisão estatística **não cria rótulos automaticamente**: anotações certificadas precisam concordar com a adjudicação antes do treinamento.
 
 [Detalhes e limites do BIA-02.5](docs/BLOCO_02_5_CONCORDANCIA_GOLD.md). **Próxima frente: BIA-02.6 — migrações, concorrência e snapshots imutáveis auditados.**
+
+## BIA-02.6 — Migrações seguras, snapshots e protocolos por instituto
+
+O protótipo passou a usar revisões de banco `0001` e `0002` em `bia_core/schema.py` em vez de depender apenas do `create_all` silencioso. Instalações antigas compatíveis são atualizadas sem apagar os registros históricos. Após backup verificado, execute `python -m bia_core.schema --database-url '<BIA_DATABASE_URL>'` e configure `BIA_AUTO_MIGRATE=0` para exigir migração explícita antes da API.
+
+- `POST /v1/datasets/gold/snapshots`: salva uma versão imutável do dataset autorizado, identificada por SHA-256; repetição do mesmo conteúdo é idempotente. `GET /v1/datasets/gold/snapshots` lista hashes, e `GET /v1/datasets/gold/snapshots/{sha256}` verifica direitos de treinamento **atuais** antes de devolver o texto; todas exigem administrador.
+- `GET /v1/institutes/{institute}/protocol` e `POST /v1/institutes/{institute}/assessments`: revisão independente com afiliação declarada nas credenciais (`institutes: ["inovaligno"]`, por exemplo). Não é permitido reutilizar o revisor gold nem adjudicador como avaliador institucional.
+- `GET /v1/institutes/assessments/report`: acordo descritivo entre as avaliações institucionais e o gold certificado, com cobertura, matrizes de confusão, recall e hash auditável. Relatórios nunca misturam certificações antigas após reabertura de trecho.
+- Restrições únicas do banco e respostas HTTP 409 protegem votos e adjudicações duplicados em concorrência. Os snapshots têm triggers que bloqueiam UPDATE/DELETE no próprio banco.
+
+**Limitações:** PostgreSQL em múltiplos processos, direitos de retenção e todas as transições concorrentes de curadoria exigem homologação adicional. Avaliação com dados sintéticos não comprova precisão científica. Veja [o protocolo completo BIA-02.6](docs/BLOCO_02_6_INFRAESTRUTURA.md). **Próximo item: BIA-02.7 — endurecimento transacional PostgreSQL e validação tripartite com corpus real autorizado.**

@@ -92,7 +92,8 @@ def make_session_factory(url: str | None = None):
         from pathlib import Path
         Path(url.removeprefix("sqlite:///")).parent.mkdir(parents=True, exist_ok=True)
     engine = create_engine(url, connect_args={"check_same_thread": False} if url.startswith("sqlite:") else {}, pool_pre_ping=True)
-    Base.metadata.create_all(engine)  # bootstrap v0; Alembic migration required before production
+    from .schema import upgrade_schema
+    upgrade_schema(engine, auto=os.getenv("BIA_AUTO_MIGRATE", "1") == "1")
     return sessionmaker(bind=engine, expire_on_commit=False)
 
 
@@ -217,3 +218,24 @@ class AgreementResolution(Base):
     label: Mapped[str] = mapped_column(String(32), nullable=False)
     reason: Mapped[str] = mapped_column(String(500), nullable=False)
     resolved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+class DatasetSnapshot(Base):
+    """Conteúdo gold persistido por hash; triggers SQL proíbem UPDATE/DELETE."""
+    __tablename__ = "dataset_snapshots"
+    sha256: Mapped[str] = mapped_column(String(64), primary_key=True)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, nullable=False)
+
+
+class InstituteAssessment(Base):
+    """Avaliação independente de um instituto; não substitui o gold adjudicado."""
+    __tablename__ = "institute_assessments"
+    __table_args__ = (UniqueConstraint("task_id", "institute", "certification_key", name="uq_institute_task_certification"),)
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    task_id: Mapped[str] = mapped_column(ForeignKey("agreement_tasks.id"), nullable=False, index=True)
+    institute: Mapped[str] = mapped_column(String(32), nullable=False)
+    certification_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    actor: Mapped[str] = mapped_column(String(128), nullable=False)
+    label: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, nullable=False)

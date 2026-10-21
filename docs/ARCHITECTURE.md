@@ -58,3 +58,11 @@ A adjudicação preserva as alternativas de duas identidades, exige uma terceira
 ### BIA-02.5 — Dupla avaliação cega e gold auditável
 
 `agreement_tasks`, `agreement_votes` e `agreement_resolutions` documentam intervalo definido antes dos votos, duas identidades fixas, respostas ocultas até finalização e decisão de terceira identidade para discordância. `bia_core/agreement.py` calcula κ de Cohen **por dupla fixa**, não agrega indivíduos diferentes e usa `null` quando indefinido. A certificação científica não é presumida a partir de acordo estatístico. `source_dataset` recusa amostras com tarefas pendentes ou incompatíveis com a anotação aprovada; treino de relações também ignora essas passagens. Um snapshot interno restringe texto a documentos autorizados para treinamento, agrupa splits por publicação e guarda `sha256` canônico. Exportação exclusiva de admin, sem licença de redistribuição. Consultar [BIA-02.5](BLOCO_02_5_CONCORDANCIA_GOLD.md). Próximo: **BIA-02.6 — migrações, transações concorrentes e versões imutáveis**.
+
+## BIA-02.6 — Persistência versionada e avaliação tripartite
+
+- Banco legado passa por revisões controladas `0001 -> 0002` (`bia_core/schema.py`), com rollback transacional e bloqueio de startup quando a migração explícita é exigida.
+- `DatasetSnapshot` persiste o corpus gold autorizado em JSON canônico com SHA-256; triggers SQL recusam UPDATE/DELETE, e revogação atual de direitos bloqueia leitura histórica via API.
+- `InstituteAssessment` registra observação independente por instituto, tarefa e versão da certificação. Não influencia o gold nem o treinamento; relatórios por instituto usam somente trechos com certificação vigente.
+- Restrições UNIQUE e `IntegrityError` tratado para operações críticas de concordância e bibliografia; alta concorrência de todos os estados e PostgreSQL distribuído continuam pendentes para produção.
+- Detalhes, interfaces, riscos e próximos testes: [BIA-02.6](BLOCO_02_6_INFRAESTRUTURA.md).

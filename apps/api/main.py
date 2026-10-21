@@ -13,6 +13,7 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, 
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from bia_core.db import Annotation, AuditEvent, Document, Passage, PassageReview, ScientificRelation, TrainingRun, RelationModelRun, RelationNegativeAssessment, make_session_factory, now
@@ -21,14 +22,15 @@ from bia_core.curation import annotations_for, review_state
 from bia_core.model import ENTITY_LABELS
 from bia_core.retrieval import bm25
 from bia_core.relations import (MAX_EVIDENCE_CHARS, RELATION_SIGNATURES, candidate_pairs,
-                                certified_anchors, is_current, relation_record)
+                                certified_anchors, is_current, relation_record, certification_key)
 from bia_core.training import extract, train
 from bia_core.relation_learning import train_relations, predict_candidates
 from bia_core.evaluation import verified_report
 from bia_core.adjudication import validate_alternative, has_overlap, unresolved_count, dispute_record
 from bia_core.bibliography import normalize_doi, signals, ordered_pair, publication_clusters
-from bia_core.db import AnnotationDispute, BibliographicDecision, AgreementTask, AgreementVote, AgreementResolution
-from bia_core.agreement import AGREEMENT_LABELS, agreement_report, task_state, votes_for, gold_snapshot
+from bia_core.db import AnnotationDispute, BibliographicDecision, AgreementTask, AgreementVote, AgreementResolution, DatasetSnapshot, InstituteAssessment
+from bia_core.institutional import INSTITUTES, create_snapshot, current_snapshot, institute_report
+from bia_core.agreement import AGREEMENT_LABELS, agreement_report, task_state, votes_for, gold_snapshot, passage_agreement_ready
 
 ROLES = ("viewer", "researcher", "curator", "admin")
 ALLOWED_RIGHTS = ("open_access", "author_permission", "institutional_permission")
@@ -102,6 +104,11 @@ class AgreementAdjudication(AgreementLabel):
     reason: str = Field(min_length=10, max_length=500)
 
 
+class InstituteEvaluation(BaseModel):
+    task_id: str
+    label: Literal["MATERIAL", "PROCESS", "PROPERTY", "QUANTITY", "UNIT", "CONDITION", "APPLICATION", "NONE"]
+
+
 class TrainRequest(BaseModel):
     epochs: int = Field(default=2, ge=1, le=25)
     seed: int = Field(default=42, ge=0, le=2**31 - 1)
@@ -150,6 +157,20 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
 
     def audit(session, user, action, resource):
         session.add(AuditEvent(actor=user["actor"], action=action, resource=resource))
+
+    def flush_unique(session, message):
+        try:
+            session.flush()
+        except IntegrityError as exc:
+            session.rollback()
+            raise HTTPException(409, message) from exc
+
+    def commit_unique(session, message):
+        try:
+            session.commit()
+        except IntegrityError as exc:
+            session.rollback()
+            raise HTTPException(409, message) from exc
 
     def get_doc(session, doc_id, user):
         doc = session.get(Document, doc_id)
@@ -513,7 +534,7 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
             verdict=data.verdict, reviewed_by=user["actor"], reason=data.reason.strip())
         session.add(decision)
         audit(session, user, "bibliography.review." + data.verdict, a + ":" + b)
-        session.commit()
+        commit_unique(session, "Par bibliográfico decidido em outra transação")
         return {"id": decision.id, "left_document_id": a, "right_document_id": b,
                 "verdict": decision.verdict, "automatically_merged": False,
                 "training_group_id": publication_clusters(session)[a]}
@@ -768,9 +789,9 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
         task = AgreementTask(passage_id=passage.id, start=data.start, end=data.end,
                              rater_a=a, rater_b=b, created_by=user["actor"])
         session.add(task)
-        session.flush()
+        flush_unique(session, "Amostra duplicada em operação concorrente")
         audit(session, user, "agreement.task.create", task.id)
-        session.commit()
+        commit_unique(session, "Amostra duplicada em operação concorrente")
         return {**task_state(session, task), "quote": passage.text[task.start:task.end]}
 
     @app.get("/v1/agreement/tasks")
@@ -823,7 +844,7 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
             raise HTTPException(409, "Amostra já adjudicada")
         session.add(AgreementVote(task_id=task.id, actor=user["actor"], label=data.label))
         audit(session, user, "agreement.vote", task.id)
-        session.commit()
+        commit_unique(session, "Voto já registrado em operação concorrente")
         # resposta não inclui votos — mantenha cegamento até conclusão.
         return task_state(session, task)
 
@@ -843,7 +864,7 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
         session.add(AgreementResolution(task_id=task.id, actor=user["actor"],
                                         label=data.label, reason=data.reason.strip()))
         audit(session, user, "agreement.adjudicate", task.id)
-        session.commit()
+        commit_unique(session, "Decisão já registrada por outra transação")
         return task_state(session, task, reveal=True)
 
     @app.get("/v1/agreement/metrics")
@@ -860,6 +881,83 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
         audit(session, user, "gold.export", snapshot["sha256"])
         session.commit()
         return snapshot
+
+    @app.post("/v1/datasets/gold/snapshots", status_code=201)
+    def save_gold_snapshot(user: dict = Depends(role("admin",)), session: Session = Depends(db)):
+        try:
+            record, created = create_snapshot(session, actor=user["actor"])
+            audit(session, user, "gold.snapshot.create" if created else "gold.snapshot.reuse", record.sha256)
+            commit_unique(session, "Snapshot já criado em outra transação; consulte pela hash")
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return {"sha256": record.sha256, "created": created, "schema": "bia.scientific_gold.v1"}
+
+    @app.get("/v1/datasets/gold/snapshots")
+    def list_gold_snapshots(user: dict = Depends(role("admin",)), session: Session = Depends(db)):
+        rows = session.scalars(select(DatasetSnapshot).order_by(DatasetSnapshot.created_at.desc()).limit(100)).all()
+        return {"snapshots": [{"sha256": r.sha256, "created_by": r.created_by,
+                               "created_at": r.created_at.isoformat()} for r in rows]}
+
+    @app.get("/v1/datasets/gold/snapshots/{digest}")
+    def get_gold_snapshot(digest: str, user: dict = Depends(role("admin",)), session: Session = Depends(db)):
+        row = session.get(DatasetSnapshot, digest)
+        if row is None:
+            raise HTTPException(404, "Snapshot não encontrado")
+        try:
+            data = current_snapshot(session, row)
+        except PermissionError as exc:
+            raise HTTPException(403, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        audit(session, user, "gold.snapshot.read", digest)
+        session.commit()
+        return data
+
+    def institute_member(institute: str, user: dict):
+        if institute not in INSTITUTES:
+            raise HTTPException(404, "Instituto não reconhecido")
+        membership = user.get("institutes", [])
+        if not isinstance(membership, list) or institute not in membership:
+            raise HTTPException(403, "Afiliação não habilitada para este instituto")
+
+    @app.get("/v1/institutes/{institute}/protocol")
+    def institutional_protocol(institute: str, user: dict = Depends(role("curator", "admin"))):
+        institute_member(institute, user)
+        return {"institute": institute, "blind_to_gold": True,
+                "review_unit": "predeclared_same_span_entity_label", "labels": sorted(AGREEMENT_LABELS),
+                "one_assessment_per_task": True, "scientifically_validated": False}
+
+    @app.post("/v1/institutes/{institute}/assessments", status_code=201)
+    def institutional_assessment(institute: str, data: InstituteEvaluation,
+                                 user: dict = Depends(role("curator", "admin")), session: Session = Depends(db)):
+        institute_member(institute, user)
+        task = session.get(AgreementTask, data.task_id)
+        if task is None:
+            raise HTTPException(404, "Amostra não encontrada")
+        passage = session.get(Passage, task.passage_id)
+        get_doc(session, passage.document_id, user)
+        state = task_state(session, task, reveal=True)
+        key = certification_key(session.get(PassageReview, task.passage_id))
+        if not key or not passage_agreement_ready(session, task.passage_id) or not state["complete"] or state["final_label"] is None:
+            raise HTTPException(409, "Gold não está concluído para esta amostra")
+        resolution = session.get(AgreementResolution, task.id)
+        if user["actor"] in (task.rater_a, task.rater_b) or (resolution and user["actor"] == resolution.actor):
+            raise HTTPException(403, "Avaliador precisa ser independente do gold")
+        if session.scalar(select(InstituteAssessment).where(
+            InstituteAssessment.task_id == task.id, InstituteAssessment.institute == institute,
+            InstituteAssessment.certification_key == key)):
+            raise HTTPException(409, "Instituto já avaliou esta amostra")
+        record = InstituteAssessment(task_id=task.id, institute=institute, certification_key=key,
+                                     actor=user["actor"], label=data.label)
+        session.add(record)
+        session.flush()
+        audit(session, user, "institute.assessment.create", record.id)
+        commit_unique(session, "Avaliação institucional concorrente já registrada")
+        return {"id": record.id, "institute": institute, "task_id": task.id, "status": "recorded_blind"}
+
+    @app.get("/v1/institutes/assessments/report")
+    def institutional_report(user: dict = Depends(role("admin",)), session: Session = Depends(db)):
+        return institute_report(session)
 
     def run_training(run_id: str, epochs: int, seed: int):
         with job_lock, session_factory() as session:
