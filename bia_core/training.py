@@ -1,7 +1,10 @@
-"""Treino CPU local: seed, splits por documento, checkpoints sem pesos externos."""
+"""Treinamento local auditável, sem checkpoints ou pesos externos.
+
+Invariante científico: somente passagens integralmente certificadas geram
+classes O (background). A ausência de rótulo em um rascunho é DESCONHECIDO.
+"""
 from __future__ import annotations
 
-from collections import defaultdict
 from dataclasses import asdict
 from hashlib import sha256
 import json
@@ -12,7 +15,8 @@ from sqlalchemy import select
 import torch
 import torch.nn.functional as F
 
-from .db import Annotation, Document, Passage
+from .curation import annotations_for
+from .db import Document, Passage, PassageReview
 from .model import BiaTagger, ENTITY_LABELS, LABELS, ModelConfig
 from .tokenizer import CharTokenizer
 
@@ -21,26 +25,35 @@ def _hash(data: bytes) -> str:
     return sha256(data).hexdigest()
 
 
-def source_dataset(session):
-    """Somente documentos com permissão explícita de treino e rótulos aprovados."""
-    rows = session.execute(
-        select(Document, Passage, Annotation)
+def source_dataset(session) -> list[dict]:
+    """Certificação dupla, direitos explícitos; zero entidades é negativo válido."""
+    records = session.execute(
+        select(Document, Passage, PassageReview)
         .join(Passage, Document.id == Passage.document_id)
-        .join(Annotation, Annotation.passage_id == Passage.id)
-        .where(Document.training_allowed.is_(True), Annotation.status == "approved")
+        .join(PassageReview, PassageReview.passage_id == Passage.id)
+        .where(Document.training_allowed.is_(True), PassageReview.status == "certified")
+        .order_by(Document.sha256, Passage.page, Passage.id)
     ).all()
-    grouped: dict[str, dict] = {}
-    for doc, passage, ann in rows:
-        entry = grouped.setdefault(passage.id, {
-            "document_id": doc.id, "sha256": doc.sha256, "text": passage.text, "annotations": [],
+    rows = []
+    for doc, passage, review in records:
+        annotations = annotations_for(session, passage.id)
+        if any(a.status == "pending" for a in annotations):
+            raise ValueError("Trecho certificado contém anotações pendentes")
+        approved = sorted(
+            ({"start": a.start, "end": a.end, "label": a.label} for a in annotations if a.status == "approved"),
+            key=lambda a: (a["start"], a["end"], a["label"]),
+        )
+        rows.append({
+            "document_id": doc.id, "sha256": doc.sha256, "passage_id": passage.id,
+            "page": passage.page, "text": passage.text, "annotations": approved,
+            "submitted_by": review.submitted_by, "certified_by": review.certified_by,
         })
-        entry["annotations"].append({"start": ann.start, "end": ann.end, "label": ann.label})
-    return list(grouped.values())
+    return rows
 
 
 def document_splits(rows: list[dict]) -> dict[str, str]:
-    """Split estável por hash de documento; nunca dividir páginas do mesmo artigo."""
-    docs = sorted(set(item["sha256"] for item in rows))
+    """Holdouts determinísticos agrupados por documento, não por trecho."""
+    docs = sorted({item["sha256"] for item in rows})
     rng = random.Random(101)
     rng.shuffle(docs)
     if len(docs) < 3:
@@ -51,26 +64,56 @@ def document_splits(rows: list[dict]) -> dict[str, str]:
 
 
 def build_samples(rows: list[dict], tokenizer: CharTokenizer, max_length: int):
+    """Particionar sem cortar entidades BIO; falhar explicitamente se impossível."""
+    if max_length < 1:
+        raise ValueError("max_length deve ser positivo")
     samples = []
+    inside = {LABELS.index("I-" + label) for label in ENTITY_LABELS}
     for row in rows:
         text = row["text"]
         labels = [0] * len(text)
         for ann in row["annotations"]:
-            b = LABELS.index("B-" + ann["label"])
-            i = LABELS.index("I-" + ann["label"])
-            for pos in range(ann["start"], ann["end"]):
+            start, end, label = ann["start"], ann["end"], ann["label"]
+            if label not in ENTITY_LABELS or not 0 <= start < end <= len(text):
+                raise ValueError("Anotação certificada possui rótulo ou offsets inválidos")
+            if end - start > max_length:
+                raise ValueError("Entidade certificada maior que max_length; ajuste o modelo")
+            for pos in range(start, end):
                 if labels[pos] != 0:
                     raise ValueError("Anotações sobrepostas devem ser resolvidas antes do treino")
-                labels[pos] = b if pos == ann["start"] else i
-        for start in range(0, len(text), max_length):
+                labels[pos] = LABELS.index(("B-" if pos == start else "I-") + label)
+        start = 0
+        while start < len(text):
             end = min(start + max_length, len(text))
-            if start and labels[start] and labels[start] != 0 and labels[start] not in [LABELS.index("B-" + key) for key in ENTITY_LABELS]:
-                # Uma entidade cruzando fronteira não deve virar evidência artificial.
-                continue
+            if end < len(text) and labels[end] in inside:
+                while end > start and labels[end] in inside:
+                    end -= 1
+                # end agora aponta para o B da entidade que cruza a borda.
+                if end == start:
+                    raise ValueError("Entidade não cabe na janela sem perda de evidência")
+            if end <= start:
+                raise ValueError("Falha na segmentação BIO")
             ids = tokenizer.encode(text[start:end])
-            if ids:
-                samples.append((row["sha256"], ids, labels[start:end]))
+            samples.append((row["sha256"], ids, labels[start:end]))
+            start = end
     return samples
+
+
+def _spans(labels: list[int]) -> set[tuple[int, int, str]]:
+    """Entidades completas por trecho (offset relativo à janela)."""
+    entities = set()
+    active = None
+    for offset, idx in enumerate(labels + [0]):
+        tag = LABELS[idx]
+        kind = tag[2:] if tag != "O" else None
+        if active and (not tag.startswith("I-") or kind != active[2]):
+            entities.add(active)
+            active = None
+        if kind and active is None:
+            active = (offset, offset + 1, kind)
+        elif active and tag.startswith("I-") and kind == active[2]:
+            active = (active[0], offset + 1, active[2])
+    return entities
 
 
 def train(session, out_dir: Path, *, epochs: int = 2, seed: int = 42, config_override: dict | None = None) -> dict:
@@ -78,14 +121,15 @@ def train(session, out_dir: Path, *, epochs: int = 2, seed: int = 42, config_ove
         raise ValueError("epochs fora da faixa permitida")
     rows = source_dataset(session)
     if not rows:
-        raise ValueError("Não há anotações aprovadas em documentos autorizados para treinamento")
+        raise ValueError("Não há trechos certificados em documentos autorizados para treinamento")
     random.seed(seed)
     torch.manual_seed(seed)
     torch.set_num_threads(min(torch.get_num_threads(), 2))
-    tokenizer = CharTokenizer.fit([item["text"] for item in rows])
+    split_map = document_splits(rows)
+    # Nenhum vocabulário é ajustado com dados de validação/teste.
+    tokenizer = CharTokenizer.fit([item["text"] for item in rows if split_map[item["sha256"]] == "train"])
     config = ModelConfig(vocab_size=len(tokenizer.vocab), **(config_override or {}))
     config.validate()
-    split_map = document_splits(rows)
     samples = build_samples(rows, tokenizer, config.max_length)
     train_samples = [(ids, labels) for key, ids, labels in samples if split_map[key] == "train"]
     val_samples = [(ids, labels) for key, ids, labels in samples if split_map[key] == "val"]
@@ -110,38 +154,52 @@ def train(session, out_dir: Path, *, epochs: int = 2, seed: int = 42, config_ove
     tp = fp = fn = 0
     with torch.inference_mode():
         for ids, target in val_samples:
-            predictions = model(torch.tensor([ids], dtype=torch.long)).argmax(-1)[0].tolist()
-            for pred, true in zip(predictions, target):
-                if pred != 0 and pred == true:
-                    tp += 1
-                elif pred != 0:
-                    fp += 1
-                if true != 0 and pred != true:
-                    fn += 1
+            predicted = model(torch.tensor([ids], dtype=torch.long)).argmax(-1)[0].tolist()
+            expected_set = _spans(target)
+            predicted_set = _spans(predicted)
+            tp += len(expected_set & predicted_set)
+            fp += len(predicted_set - expected_set)
+            fn += len(expected_set - predicted_set)
     metrics = {
-        "train_examples": len(train_samples), "validation_examples": len(val_samples),
+        "train_documents": sum(s == "train" for s in split_map.values()),
+        "validation_documents": sum(s == "val" for s in split_map.values()),
+        "test_documents": sum(s == "test" for s in split_map.values()),
+        "certified_passages": len(rows),
+        "train_examples": len(train_samples),
+        "validation_examples": len(val_samples),
         "test_examples": sum(split_map[key] == "test" for key, _, _ in samples),
         "train_last_loss": losses[-1], "scientifically_validated": False,
-        "validation_micro_precision": tp / (tp + fp) if val_samples and tp + fp else None,
-        "validation_micro_recall": tp / (tp + fn) if val_samples and tp + fn else None,
-        "validation_micro_f1": 2 * tp / (2 * tp + fp + fn) if val_samples and 2 * tp + fp + fn else None,
-        "note": "Métricas de tokens BIO, não equivalem à precisão científica por entidade.",
+        "validation_entity_precision": tp / (tp + fp) if val_samples and tp + fp else None,
+        "validation_entity_recall": tp / (tp + fn) if val_samples and tp + fn else None,
+        "validation_entity_f1": 2 * tp / (2 * tp + fp + fn) if val_samples and 2 * tp + fp + fn else None,
+        "note": "F1 por span e rótulo BIO exato; avaliação científica externa ainda necessária.",
     }
+    # Criar o diretório apenas após a avaliação do dataset, sem sobrescrever checkpoints.
     out_dir.mkdir(parents=True, exist_ok=False)
     weights = out_dir / "weights.pt"
     torch.save(model.state_dict(), weights)
     tokenizer.save(out_dir / "tokenizer.json")
-    snapshot = [{"document_sha256": item["sha256"], "passage_sha256": _hash(item["text"].encode()), "split": split_map[item["sha256"]]} for item in rows]
-    (out_dir / "dataset_snapshot.json").write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
-    manifest = {"architecture": "bia-char-transformer", "seed": seed, "epochs": epochs, "config": asdict(config),
-                "labels": LABELS, "metrics": metrics, "weights_sha256": _hash(weights.read_bytes()),
-                "tokenizer_sha256": _hash((out_dir / "tokenizer.json").read_bytes())}
+    snapshot = [{
+        "document_sha256": item["sha256"], "passage_id": item["passage_id"], "page": item["page"],
+        "passage_sha256": _hash(item["text"].encode()), "split": split_map[item["sha256"]],
+        "annotations": item["annotations"], "submitted_by": item["submitted_by"],
+        "certified_by": item["certified_by"],
+    } for item in rows]
+    snapshot_path = out_dir / "dataset_snapshot.json"
+    snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    manifest = {
+        "architecture": "bia-char-transformer", "seed": seed, "epochs": epochs,
+        "config": asdict(config), "labels": LABELS, "metrics": metrics,
+        "dataset_sha256": _hash(snapshot_path.read_bytes()),
+        "weights_sha256": _hash(weights.read_bytes()),
+        "tokenizer_sha256": _hash((out_dir / "tokenizer.json").read_bytes()),
+    }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     return metrics
 
 
 def extract(text: str, artifact_dir: Path) -> dict:
-    """Predições experimentais; toda entidade retorna o trecho original como evidência."""
+    """Predições experimentais, sempre apoiadas em trechos literais."""
     manifest = json.loads((artifact_dir / "manifest.json").read_text(encoding="utf-8"))
     weights_path = artifact_dir / "weights.pt"
     tokenizer_path = artifact_dir / "tokenizer.json"
@@ -155,9 +213,8 @@ def extract(text: str, artifact_dir: Path) -> dict:
     with torch.inference_mode():
         for start in range(0, len(text), model.config.max_length):
             ids = tokenizer.encode(text[start:start + model.config.max_length])
-            if not ids:
-                continue
-            predicted.extend(model(torch.tensor([ids], dtype=torch.long)).argmax(-1)[0].tolist())
+            if ids:
+                predicted.extend(model(torch.tensor([ids], dtype=torch.long)).argmax(-1)[0].tolist())
     entities = []
     current = None
     for index, label_id in enumerate(predicted):

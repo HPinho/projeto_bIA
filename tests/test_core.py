@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import BytesIO
+import json
 
 import pytest
 from reportlab.pdfgen import canvas
@@ -11,7 +12,8 @@ from apps.api.main import make_app
 from bia_core.db import Annotation, Document, Passage, make_session_factory
 from bia_core.retrieval import bm25, tokenize
 from bia_core.tokenizer import CharTokenizer
-from bia_core.training import document_splits, extract, train
+from bia_core.training import build_samples, document_splits, extract, source_dataset, train, _spans
+from bia_core.model import LABELS
 
 
 KEYS = {
@@ -112,10 +114,17 @@ def test_annotation_review_and_training_with_provenance(env):
                           json={"passage_id": passage["id"], "label": "PROCESS", "start": start, "end": start + 3})
     assert overlap.status_code == 409
     with factory() as session:
+        assert source_dataset(session) == []  # revisão isolada NÃO certifica texto completo
+    assert client.post(f"/v1/passages/{passage['id']}/submit", headers=bearer("editor-secret")).status_code == 200
+    assert client.post(f"/v1/passages/{passage['id']}/certify", headers=bearer("editor-secret")).status_code == 403
+    assert client.post(f"/v1/passages/{passage['id']}/certify", headers=bearer("reviewer-secret")).status_code == 200
+    with factory() as session:
         output = tmp_path / "run"
         metrics = train(session, output, epochs=2, seed=42, config_override={"dim": 16, "heads": 4, "layers": 1, "max_length": 64})
         assert metrics["train_examples"] > 0
-        assert metrics["validation_micro_f1"] is None
+        assert metrics["validation_entity_f1"] is None
+        assert metrics["certified_passages"] == 1
+        assert json.loads((output / "manifest.json").read_text())["dataset_sha256"]
         result = extract(passage["text"], output)
         assert result["scientifically_validated"] is False
         assert len(result["model_sha256"]) == 64
@@ -133,8 +142,10 @@ def test_no_training_without_explicit_permission(env):
     ann = client.post("/v1/annotations", headers=bearer("editor-secret"),
                       json={"passage_id": pid, "label": "MATERIAL", "start": 0, "end": 7}).json()["id"]
     client.post(f"/v1/annotations/{ann}/review", headers=bearer("reviewer-secret"), json={"decision": "approved"})
+    assert client.post(f"/v1/passages/{pid}/submit", headers=bearer("editor-secret")).status_code == 200
+    assert client.post(f"/v1/passages/{pid}/certify", headers=bearer("reviewer-secret")).status_code == 200
     with factory() as session:
-        with pytest.raises(ValueError, match="Não há anotações"):
+        with pytest.raises(ValueError, match="Não há trechos certificados"):
             train(session, tmp_path / "should-not-exist")
     assert client.get(f"/v1/extract/{pid}", headers=bearer("editor-secret")).json()["status"] == "insufficient_evidence"
 
@@ -146,3 +157,78 @@ def test_splits_are_by_document_not_passage():
     assert len(splits) == 12
     assert {"train", "val", "test"} == set(splits.values())
     assert splits["0x1"] == splits[items[1]["sha256"]]
+
+
+def test_certification_workflow_blocks_incomplete_and_frozen_labels(env):
+    client, factory, _ = env
+    uploaded = add_pdf(client, text="Celulose 45 MPa, lignina")
+    pid = client.get(f"/v1/documents/{uploaded.json()['id']}/passages", headers=bearer("editor-secret")).json()[0]["id"]
+    annotation = client.post("/v1/annotations", headers=bearer("editor-secret"),
+        json={"passage_id": pid, "label": "MATERIAL", "start": 0, "end": 8}).json()["id"]
+    # Rascunho sem cobertura total não pode declarar o fundo como O.
+    with factory() as session:
+        assert not source_dataset(session)
+    assert client.post(f"/v1/passages/{pid}/submit", headers=bearer("editor-secret")).status_code == 409
+    assert client.post(f"/v1/annotations/{annotation}/review", headers=bearer("reviewer-secret"), json={"decision":"approved"}).status_code == 200
+    assert client.post(f"/v1/passages/{pid}/submit", headers=bearer("editor-secret")).json()["status"] == "submitted"
+    assert client.post(f"/v1/passages/{pid}/certify", headers=bearer("editor-secret")).status_code == 403
+    assert client.post("/v1/annotations", headers=bearer("editor-secret"),
+        json={"passage_id": pid, "label":"UNIT", "start": 12, "end": 15}).status_code == 409
+    assert client.post(f"/v1/passages/{pid}/certify", headers=bearer("reviewer-secret")).json()["status"] == "certified"
+    with factory() as session:
+        rows = source_dataset(session)
+        assert len(rows) == 1 and rows[0]["annotations"][0]["label"] == "MATERIAL"
+    assert client.post(f"/v1/passages/{pid}/reopen", headers=bearer("editor-secret")).json()["status"] == "draft"
+    with factory() as session:
+        assert source_dataset(session) == []
+    assert client.get(f"/v1/passages/{pid}/review", headers=bearer("viewer-secret")).status_code == 403
+    overview = client.get("/v1/curation/summary", headers=bearer("editor-secret")).json()
+    assert overview["training_eligible_passages"] == 0
+    assert overview["passages_by_state"]["draft"] == 1
+    assert client.get("/v1/curation/summary", headers=bearer("viewer-secret")).status_code == 403
+
+
+def test_certified_no_entity_passage_is_explicit_negative(env):
+    client, factory, tmp = env
+    uploaded = add_pdf(client, text="Nenhuma entidade científica anotada")
+    pid = client.get(f"/v1/documents/{uploaded.json()['id']}/passages", headers=bearer("editor-secret")).json()[0]["id"]
+    assert client.post(f"/v1/passages/{pid}/submit", headers=bearer("editor-secret")).status_code == 200
+    assert client.post(f"/v1/passages/{pid}/certify", headers=bearer("reviewer-secret")).status_code == 200
+    with factory() as session:
+        rows = source_dataset(session)
+        assert len(rows) == 1 and rows[0]["annotations"] == []
+        metrics = train(session, tmp / "negative-only", epochs=1, config_override={"dim":16,"heads":4,"layers":1,"max_length":64})
+        assert metrics["train_examples"] >= 1
+
+
+def test_bio_segments_preserve_entire_entity_without_dropping_window():
+    codec = CharTokenizer.fit(["0123456789abcdef"])
+    rows = [{"sha256":"abc", "text":"0123456789abcdef", "annotations":[{"start":6,"end":11,"label":"MATERIAL"}]}]
+    samples = build_samples(rows, codec, max_length=8)
+    assert "".join(codec.decode(ids) for _,ids,_ in samples) == rows[0]["text"]
+    entity_labels = [label for _,_,labels in samples for label in labels]
+    assert entity_labels[6] == LABELS.index("B-MATERIAL")
+    assert entity_labels[10] == LABELS.index("I-MATERIAL")
+    assert all(labels[0] not in [LABELS.index("I-" + item) for item in ("MATERIAL", "PROCESS")] for _,_,labels in samples)
+    with pytest.raises(ValueError, match="maior que max_length"):
+        build_samples(rows, codec, max_length=4)
+    assert _spans([LABELS.index("B-MATERIAL"), LABELS.index("I-MATERIAL"), 0]) == {(0,2,"MATERIAL")}
+
+
+def test_holdout_vocabulary_does_not_leak(env):
+    client, factory, tmp = env
+    # 5 docs garantem ao menos um documento de treino, validação e teste.
+    for i, word in enumerate(["Celulose", "Lignina", "Xilana", "Biomassa", "Amido"]):
+        uploaded = add_pdf(client, text=f"{word} resultado {i}")
+        pid = client.get(f"/v1/documents/{uploaded.json()['id']}/passages", headers=bearer("editor-secret")).json()[0]["id"]
+        assert client.post(f"/v1/passages/{pid}/submit", headers=bearer("editor-secret")).status_code == 200
+        assert client.post(f"/v1/passages/{pid}/certify", headers=bearer("reviewer-secret")).status_code == 200
+    with factory() as session:
+        rows = source_dataset(session)
+        train(session, tmp / "holdout", epochs=1, config_override={"dim":16,"heads":4,"layers":1,"max_length":32})
+        snapshot = json.loads((tmp / "holdout/dataset_snapshot.json").read_text())
+        assignments = {row["document_sha256"]: row["split"] for row in snapshot}
+        assert {"train","val","test"} == set(assignments.values())
+        vocab = CharTokenizer.load(tmp / "holdout/tokenizer.json")
+        train_chars = set("".join(row["text"] for row in rows if assignments[row["sha256"]] == "train"))
+        assert set(vocab.vocab) - {"<pad>","<unk>"} == train_chars

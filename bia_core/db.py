@@ -59,6 +59,20 @@ class Annotation(Base):
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class PassageReview(Base):
+    """Full-span adjudication: missing labels mean O only after certification.
+
+    A separate table preserves compatibility with the existing bootstrap schema.
+    """
+    __tablename__ = "passage_reviews"
+    passage_id: Mapped[str] = mapped_column(ForeignKey("passages.id"), primary_key=True)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="submitted")
+    submitted_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    certified_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    certified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class AuditEvent(Base):
     __tablename__ = "audit_events"
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)

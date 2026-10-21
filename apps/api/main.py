@@ -15,8 +15,9 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from bia_core.db import Annotation, AuditEvent, Document, Passage, TrainingRun, make_session_factory, now
+from bia_core.db import Annotation, AuditEvent, Document, Passage, PassageReview, TrainingRun, make_session_factory, now
 from bia_core.ingestion import InvalidPDF, pages_from_pdf
+from bia_core.curation import annotations_for, review_state
 from bia_core.model import ENTITY_LABELS
 from bia_core.retrieval import bm25
 from bia_core.training import extract, train
@@ -149,7 +150,8 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
         get_doc(session, document_id, user)
         items = session.scalars(select(Passage).where(Passage.document_id == document_id).order_by(Passage.page)).all()
         return [{"id": p.id, "document_id": p.document_id, "page": p.page, "text": p.text,
-                 "start_offset": p.start_offset, "end_offset": p.end_offset} for p in items]
+                 "start_offset": p.start_offset, "end_offset": p.end_offset,
+                 "review": review_state(session, p.id)} for p in items]
 
     @app.get("/v1/search")
     def search(q: str = Query(min_length=2, max_length=300), year: int | None = None,
@@ -172,7 +174,10 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
             raise HTTPException(404, "Trecho não encontrado")
         if not passage.text[data.start:data.end] or data.end > len(passage.text):
             raise HTTPException(422, "Offsets excedem texto original")
-        existing = session.scalars(select(Annotation).where(Annotation.passage_id == passage.id, Annotation.status != "rejected")).all()
+        state = review_state(session, passage.id)
+        if state["status"] != "draft":
+            raise HTTPException(409, "Trecho submetido ou certificado; reabra antes de modificar")
+        existing = [a for a in annotations_for(session, passage.id) if a.status != "rejected"]
         if any(data.start < a.end and a.start < data.end for a in existing):
             raise HTTPException(409, "Anotação sobreposta; revise a existente")
         annotation = Annotation(passage_id=passage.id, label=data.label, start=data.start, end=data.end, actor=user["actor"])
@@ -187,7 +192,7 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
         passage = session.get(Passage, passage_id)
         if passage is None:
             raise HTTPException(404, "Trecho não encontrado")
-        items = session.scalars(select(Annotation).where(Annotation.passage_id == passage_id)).all()
+        items = annotations_for(session, passage_id)
         return [{"id": a.id, "label": a.label, "start": a.start, "end": a.end,
                  "quote": passage.text[a.start:a.end], "status": a.status, "actor": a.actor,
                  "reviewer": a.reviewer} for a in items]
@@ -197,6 +202,8 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
         annotation = session.get(Annotation, annotation_id)
         if annotation is None:
             raise HTTPException(404, "Anotação não encontrada")
+        if review_state(session, annotation.passage_id)["status"] != "draft":
+            raise HTTPException(409, "Trecho submetido ou certificado; reabra antes de modificar")
         if annotation.status != "pending":
             raise HTTPException(409, "Anotação já revisada")
         if annotation.actor == user["actor"]:
@@ -207,6 +214,99 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
         audit(session, user, "annotation.review." + data.decision, annotation.id)
         session.commit()
         return {"id": annotation.id, "status": annotation.status}
+
+    @app.get("/v1/passages/{passage_id}/review")
+    def get_passage_review(passage_id: str, user: dict = Depends(role("curator", "admin")), session: Session = Depends(db)):
+        passage = session.get(Passage, passage_id)
+        if passage is None:
+            raise HTTPException(404, "Trecho não encontrado")
+        get_doc(session, passage.document_id, user)
+        return review_state(session, passage_id)
+
+    @app.get("/v1/curation/summary")
+    def curation_summary(user: dict = Depends(role("curator", "admin")), session: Session = Depends(db)):
+        """Readiness counts, never confuse annotation volume with validated science."""
+        documents = session.scalars(select(Document)).all()
+        reviews = {
+            row.passage_id: row.status
+            for row in session.scalars(select(PassageReview)).all()
+        }
+        passages = session.scalars(select(Passage)).all()
+        states = {"draft": 0, "submitted": 0, "certified": 0}
+        eligible = 0
+        allowed = {d.id for d in documents if d.training_allowed}
+        for passage in passages:
+            status = reviews.get(passage.id, "draft")
+            states[status] += 1
+            if status == "certified" and passage.document_id in allowed:
+                eligible += 1
+        return {
+            "documents": len(documents), "training_authorized_documents": len(allowed),
+            "passages": len(passages), "passages_by_state": states,
+            "training_eligible_passages": eligible,
+            "scientifically_validated": False,
+        }
+
+    @app.post("/v1/passages/{passage_id}/submit")
+    def submit_passage(passage_id: str, user: dict = Depends(role("curator", "admin")), session: Session = Depends(db)):
+        passage = session.get(Passage, passage_id)
+        if passage is None:
+            raise HTTPException(404, "Trecho não encontrado")
+        get_doc(session, passage.document_id, user)
+        state = review_state(session, passage_id)
+        if state["status"] != "draft":
+            raise HTTPException(409, "Trecho já submetido ou certificado")
+        if state["pending_annotations"]:
+            raise HTTPException(409, "Revise todas as anotações pendentes antes de submeter")
+        review = session.get(PassageReview, passage_id)
+        if review is None:
+            review = PassageReview(passage_id=passage_id, submitted_by=user["actor"])
+            session.add(review)
+        else:
+            review.status = "submitted"
+            review.submitted_by = user["actor"]
+            review.submitted_at = now()
+            review.certified_by = None
+            review.certified_at = None
+        audit(session, user, "passage.review.submit", passage_id)
+        session.commit()
+        return review_state(session, passage_id)
+
+    @app.post("/v1/passages/{passage_id}/certify")
+    def certify_passage(passage_id: str, user: dict = Depends(role("curator", "admin")), session: Session = Depends(db)):
+        passage = session.get(Passage, passage_id)
+        if passage is None:
+            raise HTTPException(404, "Trecho não encontrado")
+        get_doc(session, passage.document_id, user)
+        review = session.get(PassageReview, passage_id)
+        if review is None or review.status != "submitted":
+            raise HTTPException(409, "Trecho ainda não foi submetido")
+        if review.submitted_by == user["actor"]:
+            raise HTTPException(403, "Certificação exige um segundo pesquisador")
+        if review_state(session, passage_id)["pending_annotations"]:
+            raise HTTPException(409, "Ainda existem anotações pendentes")
+        review.status = "certified"
+        review.certified_by = user["actor"]
+        review.certified_at = now()
+        audit(session, user, "passage.review.certify", passage_id)
+        session.commit()
+        return review_state(session, passage_id)
+
+    @app.post("/v1/passages/{passage_id}/reopen")
+    def reopen_passage(passage_id: str, user: dict = Depends(role("curator", "admin")), session: Session = Depends(db)):
+        passage = session.get(Passage, passage_id)
+        if passage is None:
+            raise HTTPException(404, "Trecho não encontrado")
+        get_doc(session, passage.document_id, user)
+        review = session.get(PassageReview, passage_id)
+        if review is None or review.status == "draft":
+            raise HTTPException(409, "Trecho já está em rascunho")
+        review.status = "draft"
+        review.certified_by = None
+        review.certified_at = None
+        audit(session, user, "passage.review.reopen", passage_id)
+        session.commit()
+        return review_state(session, passage_id)
 
     def run_training(run_id: str, epochs: int, seed: int):
         with job_lock, session_factory() as session:

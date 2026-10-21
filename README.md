@@ -42,10 +42,19 @@ Abrir http://localhost:3000, informar token local e importar **apenas PDFs autor
 1. Um curador cadastra um PDF digital permitido via `POST /v1/documents` (multipart: `file`, `title`, `rights_basis`, `training_allowed`; DOI e ano opcionais).
 2. Pesquisadores consultam `GET /v1/search?q=celulose`, sem chamar provedores externos. Cada resultado inclui evidência e página.
 3. Curador anota rótulos por offsets via `POST /v1/annotations`; outro curador revisa via `POST /v1/annotations/{id}/review`.
-4. Somente um administrador solicita `POST /v1/models/train` com JSON, por exemplo `{"epochs": 2, "seed": 42}`. Consultar `GET /v1/models/runs/{id}`.
-5. `GET /v1/extract/{passage_id}` executa o checkpoint local, retorna offsets, texto literal, versão e estado experimental. Se não houver modelo, retorna `insufficient_evidence`.
+4. Quando **todas** as anotações estiverem revisadas, um curador submete o trecho (`POST /v1/passages/{id}/submit`) e **outra identidade** certifica que a anotação cobre todo o texto (`POST /v1/passages/{id}/certify`). Trechos sem entidades podem ser certificados explicitamente como exemplos negativos. Trechos em rascunho **não** servem como negativos. Uma correção posterior exige `POST /v1/passages/{id}/reopen`, retirando imediatamente o trecho de novos datasets.
+5. Visualize a prontidão local via `GET /v1/curation/summary` (curadores e administradores). Somente um administrador solicita `POST /v1/models/train` com JSON, por exemplo `{"epochs": 2, "seed": 42}`. Consultar `GET /v1/models/runs/{id}`.
+6. `GET /v1/extract/{passage_id}` executa o checkpoint local, retorna offsets, texto literal, versão e estado experimental. Se não houver modelo, retorna `insufficient_evidence`.
 
 Rótulos iniciais (provisórios): `MATERIAL`, `PROCESS`, `PROPERTY`, `QUANTITY`, `UNIT`, `CONDITION`, `APPLICATION`.
+
+## Dados certificados e avaliação
+
+- Apenas documentos com `training_allowed=true` **e** trechos certificados entram no treino; isso evita transformar desconhecimento em rótulo negativo `O`.
+- O protocolo de submissão/certificação exige duas identidades diferentes. Uma revisão de anotação individual **não** certifica o texto completo.
+- Entidades BIO não são cortadas entre janelas; entidades maiores que `max_length` causam erro explícito e exigem reconfiguração. Nenhum exemplo é descartado silenciosamente.
+- Splits permanecem agrupados por SHA-256 de documento; o vocabulário é ajustado **somente com documentos de treino**. Validação mede spans de entidade completos, com métricas nulas quando os dados são insuficientes.
+- Cada execução registra hash SHA-256 do snapshot, das configurações do modelo, vocabulário e pesos. É um registro de procedência, não substitui revisão científica nem assinaturas digitais.
 
 ## Independência e ciência
 

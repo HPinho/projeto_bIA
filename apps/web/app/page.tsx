@@ -3,7 +3,8 @@ import { FormEvent, useState } from 'react';
 
 const BASE = process.env.NEXT_PUBLIC_BIA_API_URL || 'http://localhost:8000';
 type Hit = { document_id: string; title: string; doi: string | null; passage_id: string; page: number; score: number; quote: string };
-type Passage = { id: string; page: number; text: string };
+type ReviewState = { status: string; submitted_by: string | null; certified_by: string | null; approved_annotations: number; pending_annotations: number; rejected_annotations: number };
+type Passage = { id: string; page: number; text: string; review: ReviewState };
 type Annotation = { id: string; label: string; start: number; end: number; quote: string; status: string };
 
 export default function Research() {
@@ -12,6 +13,7 @@ export default function Research() {
   const [hits, setHits] = useState<Hit[]>([]);
   const [passages, setPassages] = useState<Passage[]>([]);
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
+  const [reviewState, setReviewState] = useState<ReviewState | null>(null);
   const [selected, setSelected] = useState('');
   const [message, setMessage] = useState('');
   const [modelOutput, setModelOutput] = useState('');
@@ -45,11 +47,18 @@ export default function Research() {
     await exec(async () => {
       const result: Passage[] = await api(`/v1/documents/${documentId}/passages`);
       setPassages(result); setSelected(result[0]?.id || '');
-      if (result[0]) setAnnotations(await api('/v1/annotations/' + result[0].id));
+      if (result[0]) { setAnnotations(await api('/v1/annotations/' + result[0].id)); setReviewState(result[0].review); }
+      else { setAnnotations([]); setReviewState(null); }
     });
   }
   async function choosePassage(id: string) {
-    await exec(async () => { setSelected(id); setAnnotations(await api('/v1/annotations/' + id)); });
+    await exec(async () => { setSelected(id); setAnnotations(await api('/v1/annotations/' + id)); setReviewState(await api('/v1/passages/' + id + '/review')); });
+  }
+  async function changeReview(action: 'submit' | 'certify' | 'reopen') {
+    await exec(async () => {
+      setReviewState(await api(`/v1/passages/${selected}/${action}`, { method: 'POST' }));
+      setMessage(`Trecho: ${action} concluído. Atualize o estado antes de treinar.`);
+    });
   }
   async function upload(e: FormEvent) {
     e.preventDefault();
@@ -68,12 +77,14 @@ export default function Research() {
     await exec(async () => {
       await api('/v1/annotations', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ passage_id: selected, label, start, end }) });
       setAnnotations(await api('/v1/annotations/' + selected));
+      setReviewState(await api('/v1/passages/' + selected + '/review'));
     });
   }
   async function review(id: string, decision: string) {
     await exec(async () => {
       await api(`/v1/annotations/${id}/review`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ decision }) });
       setAnnotations(await api('/v1/annotations/' + selected));
+      setReviewState(await api('/v1/passages/' + selected + '/review'));
     });
   }
   return <main>
@@ -90,9 +101,15 @@ export default function Research() {
       {hits.map(hit => <article className="result" key={hit.passage_id}><strong>{hit.title}</strong><p className="muted">Página {hit.page} · DOI {hit.doi || 'não informado'} · pontuação BM25 {hit.score.toFixed(3)}</p><pre>{hit.quote}</pre><button onClick={() => loadPassages(hit.document_id)}>Inspecionar e anotar</button></article>)}
     </section>
     {!!passages.length && <section className="card stack"><h2>Anotação e revisão científica</h2><select value={selected} onChange={e => choosePassage(e.target.value)}>{passages.map(p => <option key={p.id} value={p.id}>Página {p.page}</option>)}</select>
+      <p className="muted">Revisão integral: <strong>{reviewState?.status || 'draft'}</strong> · aprovadas: {reviewState?.approved_annotations ?? 0} · pendentes: {reviewState?.pending_annotations ?? 0}. Um segundo pesquisador deve certificar inclusive trechos sem entidades.</p>
+      <div className="row">
+        {reviewState?.status === 'draft' && <button type="button" onClick={() => changeReview('submit')}>Submeter trecho para certificação</button>}
+        {reviewState?.status === 'submitted' && <button type="button" onClick={() => changeReview('certify')}>Certificar como segundo revisor</button>}
+        {(reviewState?.status === 'submitted' || reviewState?.status === 'certified') && <button type="button" onClick={() => changeReview('reopen')}>Reabrir trecho</button>}
+      </div>
       <pre>{passages.find(p => p.id === selected)?.text}</pre><small>Offsets são posições de caracteres do texto extraído acima, começando em zero.</small>
       <form className="row" onSubmit={annotate}><select value={label} onChange={e => setLabel(e.target.value)}>{['MATERIAL', 'PROCESS', 'PROPERTY', 'QUANTITY', 'UNIT', 'CONDITION', 'APPLICATION'].map(v => <option key={v}>{v}</option>)}</select>
-        <label>Início <input type="number" min={0} value={start} onChange={e => setStart(Number(e.target.value))} /></label><label>Fim <input type="number" min={1} value={end} onChange={e => setEnd(Number(e.target.value))} /></label><button disabled={!token}>Anotar</button></form>
+        <label>Início <input type="number" min={0} value={start} onChange={e => setStart(Number(e.target.value))} /></label><label>Fim <input type="number" min={1} value={end} onChange={e => setEnd(Number(e.target.value))} /></label><button disabled={!token || reviewState?.status !== 'draft'}>Anotar</button></form>
       {annotations.map(a => <div key={a.id} className="result"><strong>{a.label}</strong> — “{a.quote}” ({a.status}) {a.status === 'pending' && <><button onClick={() => review(a.id, 'approved')}>Aprovar</button> <button onClick={() => review(a.id, 'rejected')}>Rejeitar</button></>}</div>)}
       <button onClick={() => exec(async () => { const r = await api('/v1/extract/' + selected); setModelOutput(JSON.stringify(r, null, 2)); })}>Extrair com o modelo local</button>{modelOutput && <pre>{modelOutput}</pre>}
     </section>}

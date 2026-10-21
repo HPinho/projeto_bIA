@@ -9,9 +9,9 @@ Dar suporte ao levantamento e à análise de literatura científica em materiais
 1. Cadastramento de PDF digital com título, DOI opcional, ano opcional, declaração de base de direitos e confirmação **separada** da autorização para treinamento.
 2. SHA-256 e armazenamento local privado; extração de texto por página com `pypdf`. Documentos sem texto entram em `needs_review`; não são classificados como vazios.
 3. Pesquisa BM25 escrita no projeto. Saídas documentam IDs, título, DOI, página, trecho e score. Evidência ausente produz `insufficient_evidence`.
-4. Curadores anotam offsets Unicode do texto extraído. Outra identidade precisa aprovar ou rejeitar a anotação. As decisões são auditadas.
+4. Curadores anotam offsets Unicode do texto extraído. Outra identidade precisa aprovar ou rejeitar a anotação. Depois, o trecho integral deve ser submetido e certificado por identidade distinta; inclusive a ausência de entidades deve ser confirmada. Reabertura invalida a elegibilidade de treinamento. Todos os eventos são auditados.
 5. Treinamento local CPU com tokenizador Unicode treinado no corpus permitido, encoder Transformer (atenção multi-head, MLP, embeddings e normalização) implementado no repositório, inicializado de pesos aleatórios. PyTorch fornece apenas operações, gradientes e otimização.
-6. Checkpoint de pesos, vocabulário, manifesto de métricas e snapshot com hashes e split agrupado por SHA-256 do documento.
+6. Checkpoint de pesos, vocabulário, manifesto de métricas e snapshot incluindo todas as anotações aprovadas e revisores, com hashes e split agrupado por SHA-256 do documento. O vocabulário só observa treino, jamais o conjunto de validação ou teste; treinamento admite apenas trechos integralmente certificados e autorizados.
 7. Inferência experimental retorna offsets e segmentos **exatamente recuperados do texto original**. Nunca atribuir validação científica com base num smoke test.
 
 ## Modelo e vieses
@@ -29,8 +29,10 @@ O tokenizador **inicial** é em caracteres, não BPE. Isso permite testar UTF-8/
 - Criação automática de tabelas via SQLAlchemy é somente para bootstrap; antes de produção implantar Alembic com migrações versionadas.
 - Pesquisa reavalia corpus em memória a cada consulta; substituir por índice persistente para escala.
 - PDF digital simples apenas, sem OCR científico, extração de gráficos ou tabelas de alta confiabilidade. Revisão especializada é indispensável.
-- Métricas atuais referem-se a tokens BIO e não medem concordância científica entre extratores e especialistas.
-- Treino usa recortes fixos de caracteres; uma entidade que cruza uma fronteira de recorte é excluída daquele recorte para evitar rotulagem fabricada. Refinar estratégia de janelas antes de datasets grandes.
+- Métricas atuais são de correspondência exata de entidade BIO em validação interna, **não** de concordância entre extratores e especialistas. Sem exemplos de validação, são `null`.
+- As janelas de caracteres deslocam suas fronteiras para não cortar entidades BIO; entidades acima de `max_length` são rejeitadas explicitamente, sem descarte silencioso. Um corpus científico grande exigirá batching e monitoramento de capacidade.
+- Submissão e certificação são atos de curadoria dentro do protótipo, não uma alegação de validação científica externa. Antes de produção, registrar protocolos de avaliação e acordos entre os INCTs.
+- A tabela `passage_reviews` é nova e pode ser criada pelo bootstrap SQLAlchemy, mas **não** há migrações Alembic de produção.
 - O dataset de avaliação deve ser definido por pesquisadores, com amostras não sintéticas e aprovação de política de direitos de uso.
 
 ## Próximo bloco
