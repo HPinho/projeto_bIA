@@ -15,11 +15,13 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from bia_core.db import Annotation, AuditEvent, Document, Passage, PassageReview, TrainingRun, make_session_factory, now
+from bia_core.db import Annotation, AuditEvent, Document, Passage, PassageReview, ScientificRelation, TrainingRun, make_session_factory, now
 from bia_core.ingestion import InvalidPDF, pages_from_pdf
 from bia_core.curation import annotations_for, review_state
 from bia_core.model import ENTITY_LABELS
 from bia_core.retrieval import bm25
+from bia_core.relations import (MAX_EVIDENCE_CHARS, RELATION_SIGNATURES, candidate_pairs,
+                                certified_anchors, is_current, relation_record)
 from bia_core.training import extract, train
 
 ROLES = ("viewer", "researcher", "curator", "admin")
@@ -35,6 +37,19 @@ class NewAnnotation(BaseModel):
 
 class ReviewDecision(BaseModel):
     decision: Literal["approved", "rejected"]
+
+
+class RelationProposal(BaseModel):
+    passage_id: str
+    subject_annotation_id: str
+    object_annotation_id: str
+    relation_type: Literal[
+        "MATERIAL_HAS_PROPERTY", "MATERIAL_PROCESSED_BY", "PROCESS_HAS_CONDITION",
+        "PROCESS_HAS_QUANTITY", "PROPERTY_HAS_QUANTITY", "QUANTITY_HAS_UNIT",
+        "MATERIAL_HAS_APPLICATION", "MATERIAL_CONTAINS",
+    ]
+    evidence_start: int = Field(ge=0)
+    evidence_end: int = Field(gt=0)
 
 
 class TrainRequest(BaseModel):
@@ -307,6 +322,132 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
         audit(session, user, "passage.review.reopen", passage_id)
         session.commit()
         return review_state(session, passage_id)
+
+    @app.get("/v1/passages/{passage_id}/relation-candidates")
+    def relation_candidates(passage_id: str, user: dict = Depends(role("curator", "admin")),
+                            session: Session = Depends(db)):
+        passage = session.get(Passage, passage_id)
+        if passage is None:
+            raise HTTPException(404, "Trecho não encontrado")
+        get_doc(session, passage.document_id, user)
+        candidates = candidate_pairs(session, passage.id)
+        return {"passage_id": passage.id, "status": "candidate_unverified" if candidates else "no_candidates",
+                "warning": "Proximidade de entidades não prova nenhuma relação científica",
+                "candidates": candidates}
+
+    @app.post("/v1/relations", status_code=201)
+    def propose_relation(data: RelationProposal, user: dict = Depends(role("curator", "admin")),
+                         session: Session = Depends(db)):
+        passage = session.get(Passage, data.passage_id)
+        if passage is None:
+            raise HTTPException(404, "Trecho não encontrado")
+        get_doc(session, passage.document_id, user)
+        key, approved = certified_anchors(session, passage.id)
+        if key is None:
+            raise HTTPException(409, "Certifique integralmente o trecho antes de propor relações")
+        source, target = approved.get(data.subject_annotation_id), approved.get(data.object_annotation_id)
+        if source is None or target is None or source.id == target.id:
+            raise HTTPException(422, "Os dois argumentos devem ser anotações aprovadas e distintas do mesmo trecho")
+        if (source.label, target.label) != RELATION_SIGNATURES[data.relation_type]:
+            raise HTTPException(422, "Assinatura dos rótulos incompatível com a relação")
+        begin, end = min(source.start, target.start), max(source.end, target.end)
+        if not (data.evidence_start <= begin and end <= data.evidence_end <= len(passage.text)):
+            raise HTTPException(422, "A evidência literal deve conter integralmente os dois argumentos")
+        if data.evidence_end - data.evidence_start > MAX_EVIDENCE_CHARS:
+            raise HTTPException(422, "Evidência muito extensa; selecione um trecho menor")
+        existing = session.scalar(select(ScientificRelation).where(
+            ScientificRelation.passage_id == passage.id,
+            ScientificRelation.certification_key == key,
+            ScientificRelation.subject_annotation_id == source.id,
+            ScientificRelation.object_annotation_id == target.id,
+            ScientificRelation.relation_type == data.relation_type,
+        ))
+        if existing:
+            raise HTTPException(409, "Esta relação já foi proposta para esta certificação")
+        rel = ScientificRelation(passage_id=passage.id, subject_annotation_id=source.id,
+            object_annotation_id=target.id, relation_type=data.relation_type,
+            evidence_start=data.evidence_start, evidence_end=data.evidence_end,
+            certification_key=key, proposed_by=user["actor"])
+        session.add(rel)
+        session.flush()
+        audit(session, user, "relation.propose", rel.id)
+        session.commit()
+        return {"id": rel.id, "status": rel.status, "relation_type": rel.relation_type,
+                "evidence_quote": passage.text[rel.evidence_start:rel.evidence_end]}
+
+    @app.post("/v1/relations/{relation_id}/review")
+    def review_relation(relation_id: str, data: ReviewDecision,
+                        user: dict = Depends(role("curator", "admin")), session: Session = Depends(db)):
+        rel = session.get(ScientificRelation, relation_id)
+        if rel is None:
+            raise HTTPException(404, "Relação não encontrada")
+        passage = session.get(Passage, rel.passage_id)
+        get_doc(session, passage.document_id, user)
+        if rel.status != "pending":
+            raise HTTPException(409, "Relação já revisada")
+        if rel.proposed_by == user["actor"]:
+            raise HTTPException(403, "Uma segunda identidade deve revisar a relação")
+        key, approved = certified_anchors(session, rel.passage_id)
+        if key != rel.certification_key or not key or (approved.get(rel.subject_annotation_id) is None
+            or approved.get(rel.object_annotation_id) is None):
+            raise HTTPException(409, "Certificação alterada; relação obsoleta")
+        rel.status = data.decision
+        rel.reviewed_by = user["actor"]
+        rel.reviewed_at = now()
+        audit(session, user, "relation.review." + data.decision, rel.id)
+        session.commit()
+        return {"id": rel.id, "status": rel.status, "verified": is_current(session, rel)}
+
+    @app.get("/v1/passages/{passage_id}/relations")
+    def relations_for_passage(passage_id: str, user: dict = Depends(role("curator", "admin")),
+                              session: Session = Depends(db)):
+        passage = session.get(Passage, passage_id)
+        if passage is None:
+            raise HTTPException(404, "Trecho não encontrado")
+        get_doc(session, passage.document_id, user)
+        rows = session.scalars(select(ScientificRelation).where(
+            ScientificRelation.passage_id == passage_id).order_by(ScientificRelation.created_at, ScientificRelation.id)).all()
+        current, _ = certified_anchors(session, passage_id)
+        return {"passage_id": passage_id, "relations": [{
+            "id": r.id, "relation_type": r.relation_type, "status": r.status,
+            "certification_current": current == r.certification_key,
+            "verified": is_current(session, r),
+            "subject_annotation_id": r.subject_annotation_id,
+            "object_annotation_id": r.object_annotation_id,
+            "evidence_quote": passage.text[r.evidence_start:r.evidence_end],
+            "proposed_by": r.proposed_by, "reviewed_by": r.reviewed_by,
+        } for r in rows]}
+
+    @app.get("/v1/relations/search")
+    def search_relations(q: str | None = Query(default=None, min_length=2, max_length=300),
+                         relation_type: str | None = None,
+                         limit: int = Query(default=20, ge=1, le=50),
+                         user: dict = Depends(role(*ROLES)), session: Session = Depends(db)):
+        if relation_type is not None and relation_type not in RELATION_SIGNATURES:
+            raise HTTPException(422, "Tipo de relação não reconhecido")
+        rows = session.execute(select(ScientificRelation, Passage, Document)
+            .join(Passage, Passage.id == ScientificRelation.passage_id)
+            .join(Document, Document.id == Passage.document_id)
+            .where(ScientificRelation.status == "approved")
+            .order_by(Document.sha256, Passage.page, ScientificRelation.id)).all()
+        verified = []
+        for rel, passage, doc in rows:
+            if (relation_type and rel.relation_type != relation_type) or not visible(doc, user):
+                continue
+            if not is_current(session, rel):
+                continue
+            _, anchors = certified_anchors(session, passage.id)
+            record = relation_record(rel, passage, doc, anchors)
+            verified.append(record)
+        if q is not None:
+            contexts = [f"{r['subject']['quote']} {r['object']['quote']} {r['evidence']['quote']}" for r in verified]
+            weights = bm25(q, contexts)
+            ordered = sorted(((weights[i], r) for i, r in enumerate(verified) if weights[i] > 0),
+                             key=lambda t: (-t[0], t[1]["id"]))
+            verified = [r for _, r in ordered]
+        return {"status": "ok" if verified else "insufficient_evidence", "scientifically_validated": False,
+                "scope": "human_reviewed_relations_not_externally_validated",
+                "results": verified[:limit]}
 
     def run_training(run_id: str, epochs: int, seed: int):
         with job_lock, session_factory() as session:

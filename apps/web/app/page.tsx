@@ -6,6 +6,9 @@ type Hit = { document_id: string; title: string; doi: string | null; passage_id:
 type ReviewState = { status: string; submitted_by: string | null; certified_by: string | null; approved_annotations: number; pending_annotations: number; rejected_annotations: number };
 type Passage = { id: string; page: number; text: string; review: ReviewState };
 type Annotation = { id: string; label: string; start: number; end: number; quote: string; status: string };
+type CandidateRelation = { subject_annotation_id: string; object_annotation_id: string; relation_type: string; evidence_start: number; evidence_end: number; evidence_quote: string; status: string };
+type CuratedRelation = { id: string; relation_type: string; status: string; verified: boolean; certification_current: boolean; evidence_quote: string; proposed_by: string; reviewed_by: string | null };
+type VerifiedRelation = { id: string; title: string; doi: string | null; page: number; relation_type: string; subject: { quote: string }; object: { quote: string }; evidence: { quote: string }; review: { proposed_by: string; reviewed_by: string } };
 
 export default function Research() {
   const [token, setToken] = useState('');
@@ -17,6 +20,10 @@ export default function Research() {
   const [selected, setSelected] = useState('');
   const [message, setMessage] = useState('');
   const [modelOutput, setModelOutput] = useState('');
+  const [candidates, setCandidates] = useState<CandidateRelation[]>([]);
+  const [curatedRelations, setCuratedRelations] = useState<CuratedRelation[]>([]);
+  const [relationResults, setRelationResults] = useState<VerifiedRelation[]>([]);
+  const [relationQuery, setRelationQuery] = useState('celulose');
   const [label, setLabel] = useState('MATERIAL');
   const [start, setStart] = useState(0);
   const [end, setEnd] = useState(1);
@@ -47,16 +54,22 @@ export default function Research() {
     await exec(async () => {
       const result: Passage[] = await api(`/v1/documents/${documentId}/passages`);
       setPassages(result); setSelected(result[0]?.id || '');
+      setCandidates([]); setCuratedRelations([]); setModelOutput('');
       if (result[0]) { setAnnotations(await api('/v1/annotations/' + result[0].id)); setReviewState(result[0].review); }
       else { setAnnotations([]); setReviewState(null); }
     });
   }
   async function choosePassage(id: string) {
-    await exec(async () => { setSelected(id); setAnnotations(await api('/v1/annotations/' + id)); setReviewState(await api('/v1/passages/' + id + '/review')); });
+    await exec(async () => {
+      setSelected(id); setCandidates([]); setCuratedRelations([]); setModelOutput('');
+      setAnnotations(await api('/v1/annotations/' + id));
+      setReviewState(await api('/v1/passages/' + id + '/review'));
+    });
   }
   async function changeReview(action: 'submit' | 'certify' | 'reopen') {
     await exec(async () => {
       setReviewState(await api(`/v1/passages/${selected}/${action}`, { method: 'POST' }));
+      setCandidates([]); setCuratedRelations([]);
       setMessage(`Trecho: ${action} concluído. Atualize o estado antes de treinar.`);
     });
   }
@@ -87,8 +100,45 @@ export default function Research() {
       setReviewState(await api('/v1/passages/' + selected + '/review'));
     });
   }
+  async function loadRelations() {
+    await exec(async () => {
+      const [suggestions, existing] = await Promise.all([
+        api(`/v1/passages/${selected}/relation-candidates`),
+        api(`/v1/passages/${selected}/relations`),
+      ]);
+      setCandidates(suggestions.candidates);
+      setCuratedRelations(existing.relations);
+      setMessage('Sugestões são hipóteses; nenhuma relação é publicada sem revisão independente.');
+    });
+  }
+  async function propose(candidate: CandidateRelation) {
+    await exec(async () => {
+      await api('/v1/relations', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ passage_id: selected, ...candidate }) });
+      const existing = await api(`/v1/passages/${selected}/relations`);
+      setCuratedRelations(existing.relations);
+      setMessage('Relação proposta. Outro curador precisa revisar a evidência original.');
+    });
+  }
+  async function reviewRelation(relationId: string, decision: 'approved' | 'rejected') {
+    await exec(async () => {
+      await api(`/v1/relations/${relationId}/review`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision }) });
+      const existing = await api(`/v1/passages/${selected}/relations`);
+      setCuratedRelations(existing.relations);
+      setMessage('Revisão registrada. Apenas relações aprovadas com certificação vigente são consultáveis.');
+    });
+  }
+  async function searchRelations(e: FormEvent) {
+    e.preventDefault();
+    await exec(async () => {
+      const found = await api('/v1/relations/search?q=' + encodeURIComponent(relationQuery));
+      setRelationResults(found.results);
+      setMessage(found.results.length ? `${found.results.length} relações revisadas com evidência.` : 'Nenhuma relação revisada localizada.');
+    });
+  }
   return <main>
-    <header><span className="badge">Bloco 01 · Protótipo científico</span><h1>bIA</h1><p className="muted">Inteligência de materiais com fontes verificáveis · modelo próprio · processamento local</p></header>
+    <header><span className="badge">Bloco 02.1 · Relações científicas experimentais</span><h1>bIA</h1><p className="muted">Inteligência de materiais com fontes verificáveis · modelo próprio · processamento local</p></header>
     <section className="card stack"><h2>Conexão com o laboratório</h2><label>Token de acesso (somente memória desta aba)</label><input type="password" value={token} autoComplete="off" onChange={e => setToken(e.target.value)} placeholder="Bearer token configurado na API" /><small>Use tokens diferentes para criar e revisar anotações. Não utilize este protótipo publicamente sem autenticação institucional.</small></section>
     <section className="card"><h2>Importar documento científico autorizado</h2><form className="stack" onSubmit={upload}>
       <input required placeholder="Título do trabalho" value={title} onChange={e => setTitle(e.target.value)} />
@@ -111,8 +161,29 @@ export default function Research() {
       <form className="row" onSubmit={annotate}><select value={label} onChange={e => setLabel(e.target.value)}>{['MATERIAL', 'PROCESS', 'PROPERTY', 'QUANTITY', 'UNIT', 'CONDITION', 'APPLICATION'].map(v => <option key={v}>{v}</option>)}</select>
         <label>Início <input type="number" min={0} value={start} onChange={e => setStart(Number(e.target.value))} /></label><label>Fim <input type="number" min={1} value={end} onChange={e => setEnd(Number(e.target.value))} /></label><button disabled={!token || reviewState?.status !== 'draft'}>Anotar</button></form>
       {annotations.map(a => <div key={a.id} className="result"><strong>{a.label}</strong> — “{a.quote}” ({a.status}) {a.status === 'pending' && <><button onClick={() => review(a.id, 'approved')}>Aprovar</button> <button onClick={() => review(a.id, 'rejected')}>Rejeitar</button></>}</div>)}
+      <section className="subpanel stack"><h3>Relações entre materiais, processos e propriedades</h3>
+        <p className="muted">Pares próximos no texto são <strong>somente sugestões</strong>. A relação proposta precisa incluir os dois argumentos na evidência literal e ser aprovada por outra identidade. Reabrir o trecho revoga a validade das relações anteriores.</p>
+        <button type="button" disabled={!selected || !token || reviewState?.status !== 'certified'} onClick={loadRelations}>Carregar sugestões e revisões</button>
+        {candidates.map((c, index) => <article className="result" key={`${c.subject_annotation_id}:${c.object_annotation_id}:${c.relation_type}:${index}`}>
+          <strong>{c.relation_type}</strong><p>{c.evidence_quote}</p>
+          <button type="button" disabled={reviewState?.status !== 'certified'} onClick={() => propose(c)}>Propor esta relação</button>
+        </article>)}
+        {curatedRelations.map(r => <article className="result" key={r.id}>
+          <strong>{r.relation_type}</strong> · <span>{r.status}</span> · {r.verified ? 'revisada e vigente' : r.certification_current ? 'não publicada' : 'certificação obsoleta'}
+          <p>{r.evidence_quote}</p><small>Proponente: {r.proposed_by} · Revisor: {r.reviewed_by || 'pendente'}</small>
+          {r.status === 'pending' && r.certification_current && <div className="row"><button type="button" onClick={() => reviewRelation(r.id, 'approved')}>Aprovar relação</button><button type="button" onClick={() => reviewRelation(r.id, 'rejected')}>Rejeitar relação</button></div>}
+        </article>)}
+      </section>
       <button onClick={() => exec(async () => { const r = await api('/v1/extract/' + selected); setModelOutput(JSON.stringify(r, null, 2)); })}>Extrair com o modelo local</button>{modelOutput && <pre>{modelOutput}</pre>}
     </section>}
+    <section className="card stack"><h2>Grafo de relações revisadas</h2>
+      <p className="muted">Busca somente relações propostas e aprovadas por pessoas distintas, ligadas a evidência original e certificação vigente. Não substitui verificação científica independente.</p>
+      <form className="row" onSubmit={searchRelations}><input value={relationQuery} onChange={e => setRelationQuery(e.target.value)} placeholder="Material ou propriedade" style={{ flex: 1 }} /><button disabled={!token || relationQuery.length < 2}>Buscar relações</button></form>
+      {relationResults.map(r => <article className="result" key={r.id}><strong>{r.subject.quote} → {r.relation_type} → {r.object.quote}</strong>
+        <p className="muted">{r.title} · Página {r.page} · DOI {r.doi || 'não informado'}</p>
+        <pre>{r.evidence.quote}</pre><small>Revisão: {r.review.proposed_by} / {r.review.reviewed_by}</small>
+      </article>)}
+    </section>
     {message && <section className="card" role="status"><p>{message}</p></section>}
     <footer className="muted">Resultados de IA são experimentais e exigem validação de pesquisadores. Não são descobertas científicas confirmadas.</footer>
   </main>;

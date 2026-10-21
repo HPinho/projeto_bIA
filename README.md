@@ -74,3 +74,17 @@ Os testes geram PDFs e corpus sintéticos; não baixam modelos e não exigem GPU
 Consulte [a arquitetura e limitações](docs/ARCHITECTURE.md) para planejamento de produção e critérios científicos pendentes.
 
 **Próxima frente:** Bloco 02 — extração de relações experimentais, após validação do Bloco 01 e definição do recorte pelos três INCTs.
+
+## Bloco 02.1 — Relações entre materiais e experimentos
+
+O grafo de relações é **curado**, não gerado automaticamente por IA. O painel oferece sugestões de pares próximos no mesmo trecho certificado, mas essa proximidade **não** é uma afirmação científica. Um curador propõe a relação e outra identidade precisa revisar a evidência literal antes de sua publicação.
+
+- `GET /v1/passages/{id}/relation-candidates` — hipóteses com referência literal (curadores).
+- `POST /v1/relations` — registra proposta em trecho certificado, com argumentos aprovados, direção tipada e offsets da evidência (curadores).
+- `POST /v1/relations/{id}/review` — decisão de segundo revisor (`approved`/`rejected`).
+- `GET /v1/passages/{id}/relations` — histórico de curadoria, inclusive relações obsoletas (curadores).
+- `GET /v1/relations/search?q=...` — somente relações aprovadas e vigentes, respeitando os direitos do documento e incluindo DOI, página, offsets e evidência.
+
+Reabrir ou recertificar um trecho invalida, para consulta, relações de certificações anteriores. Nenhuma relação é aprendida ou publicada automaticamente: o Transformer próprio existente extrai **entidades experimentais**, não relações.
+
+Veja [protocolo, limitações e próxima etapa](docs/BLOCO_02_1_RELACOES.md). **Próximo item: BIA-02.2 — protocolo de negativos explícitos e treinamento de um classificador de relações com pesos próprios**, após definição das regras científicas pelos INCTs.

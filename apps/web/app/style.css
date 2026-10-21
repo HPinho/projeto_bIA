@@ -17,3 +17,6 @@ small, .muted { color: #556477; }
 pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #f5f7fa; padding: 12px; border-radius: 8px; }
 .error { color: #9b2222; }
 .result { border-top: 1px solid #e6e6e6; padding-top: 12px; margin-top: 12px; }
+
+.subpanel { padding: 14px; border: 1px solid #dde7f1; border-radius: 10px; background: #f9fbfd; }
+.subpanel h3 { margin: 0; }

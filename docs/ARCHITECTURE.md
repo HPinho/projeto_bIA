@@ -38,3 +38,7 @@ O tokenizador **inicial** é em caracteres, não BPE. Isso permite testar UTF-8/
 ## Próximo bloco
 
 Bloco 02: extração supervisionada de relações material–processo–condição–propriedade e avaliação científica por instituto. Pré-requisito: recorte temático, treinamento permitido, protocolo de anotação, baseline verde e critérios mínimos de aceitação acordados.
+
+### Bloco 02.1: grafo curado de relações (rodada 03)
+
+Relações direcionais usam duas entidades aprovadas no mesmo trecho, offsets literais de evidência e um identificador criptográfico da **versão de certificação**. Sugestões heurísticas são apresentadas como hipóteses, não como resultados do modelo. A consulta é restrita a relações aprovadas por revisor independente, certificação vigente e direitos de acesso compatíveis. A reabertura do trecho invalida o grafo derivado sem apagar o registro auditável. A próxima frente BIA-02.2 trata de treinamento de relações com dados explicitamente validados, não de treinar em negativas presumidas. Consulte `docs/BLOCO_02_1_RELACOES.md`.

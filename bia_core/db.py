@@ -104,3 +104,25 @@ class TrainingRun(Base):
     metrics_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class ScientificRelation(Base):
+    """Relação anotada; a certificação do trecho é versionada por hash.
+
+    Relações aprovadas não permanecem publicáveis após reabertura/recertificação
+    da passagem, mesmo que a evidência textual ainda exista.
+    """
+    __tablename__ = "scientific_relations"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    passage_id: Mapped[str] = mapped_column(ForeignKey("passages.id"), nullable=False, index=True)
+    subject_annotation_id: Mapped[str] = mapped_column(ForeignKey("annotations.id"), nullable=False)
+    object_annotation_id: Mapped[str] = mapped_column(ForeignKey("annotations.id"), nullable=False)
+    relation_type: Mapped[str] = mapped_column(String(48), nullable=False)
+    evidence_start: Mapped[int] = mapped_column(Integer, nullable=False)
+    evidence_end: Mapped[int] = mapped_column(Integer, nullable=False)
+    certification_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="pending")
+    proposed_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    reviewed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
