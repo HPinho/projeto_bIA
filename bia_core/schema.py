@@ -1,6 +1,7 @@
 """BIA-02.6: migrações transacionais e verificáveis, sem depender de APIs externas.
 
-0001 marca o esquema histórico; 0002 adiciona avaliações e snapshots append-only.
+0001 marca o esquema histórico; 0002 adiciona avaliações e snapshots append-only;
+0003 adiciona governança de retenção sem remover fontes nem direitos históricos.
 Não modifica colunas antigas nem elimina dados. Instalações antigas sem tabela de versão
 são reconhecidas somente quando o conjunto de tabelas histórico está completo.
 """
@@ -12,13 +13,13 @@ from datetime import datetime, timezone
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
 
-VERSIONS = ("0001", "0002")
+VERSIONS = ("0001", "0002", "0003")
 VERSION_TABLE = "bia_schema_versions"
 
 
 def upgrade_schema(engine: Engine, *, auto: bool = True) -> str:
     from .db import Base
-    new_tables = {"dataset_snapshots", "institute_assessments"}
+    new_tables = {"dataset_snapshots", "institute_assessments", "document_governance"}
     old_tables = [t for t in Base.metadata.sorted_tables if t.name not in new_tables]
     with engine.connect() as conn:
         try:
@@ -51,7 +52,7 @@ def upgrade_schema(engine: Engine, *, auto: bool = True) -> str:
             if VERSIONS[1] not in recorded:
                 if not auto:
                     raise RuntimeError("Schema desatualizado; execute python -m bia_core.schema")
-                Base.metadata.create_all(conn, tables=[Base.metadata.tables[n] for n in sorted(new_tables)], checkfirst=True)
+                Base.metadata.create_all(conn, tables=[Base.metadata.tables[n] for n in ("dataset_snapshots", "institute_assessments")], checkfirst=True)
                 # Imutabilidade no próprio banco, inclusive contra escrita fora da API.
                 if engine.dialect.name == "sqlite":
                     conn.exec_driver_sql("""CREATE TRIGGER IF NOT EXISTS bia_snapshot_no_update
@@ -67,6 +68,12 @@ def upgrade_schema(engine: Engine, *, auto: bool = True) -> str:
                     raise RuntimeError("Snapshots imutáveis não homologados para este dialeto")
                 conn.execute(text("INSERT INTO bia_schema_versions (version, installed_utc) VALUES (:version, :at)"),
                              {"version": VERSIONS[1], "at": datetime.now(timezone.utc).isoformat()})
+            if VERSIONS[2] not in recorded:
+                if not auto:
+                    raise RuntimeError("Schema desatualizado; execute python -m bia_core.schema")
+                Base.metadata.create_all(conn, tables=[Base.metadata.tables["document_governance"]], checkfirst=True)
+                conn.execute(text("INSERT INTO bia_schema_versions (version, installed_utc) VALUES (:version, :at)"),
+                             {"version": VERSIONS[2], "at": datetime.now(timezone.utc).isoformat()})
             if engine.dialect.name == "sqlite":
                 installed = {r[0] for r in conn.exec_driver_sql(
                     "SELECT name FROM sqlite_master WHERE type='trigger' AND name IN ('bia_snapshot_no_update', 'bia_snapshot_no_delete')")}

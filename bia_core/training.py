@@ -34,7 +34,7 @@ def source_dataset(session) -> list[dict]:
         select(Document, Passage, PassageReview)
         .join(Passage, Document.id == Passage.document_id)
         .join(PassageReview, PassageReview.passage_id == Passage.id)
-        .where(Document.training_allowed.is_(True), PassageReview.status == "certified")
+        .where(Document.training_allowed.is_(True), Document.status == "ready", PassageReview.status == "certified")
         .order_by(Document.sha256, Passage.page, Passage.id)
     ).all()
     rows = []

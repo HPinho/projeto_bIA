@@ -73,7 +73,7 @@ def test_schema_migrates_old_versionless_db_and_preserves_documents(tmp_path):
     db = f"sqlite:///{tmp_path / 'legacy.sqlite3'}"
     engine = create_engine(db)
     old = [table for table in Base.metadata.sorted_tables
-           if table.name not in {'dataset_snapshots', 'institute_assessments'}]
+           if table.name not in {'dataset_snapshots', 'institute_assessments', 'document_governance'}]
     Base.metadata.create_all(engine, tables=old)
     with engine.begin() as conn:
         conn.execute(Document.__table__.insert().values(
@@ -83,9 +83,9 @@ def test_schema_migrates_old_versionless_db_and_preserves_documents(tmp_path):
     factory = make_session_factory(db)
     with factory() as session:
         assert session.get(Document, 'a' * 32).title == 'LEGACY'
-        assert session.execute(text('SELECT version FROM bia_schema_versions ORDER BY version')).scalars().all() == ['0001', '0002']
-    assert {'dataset_snapshots', 'institute_assessments'}.issubset(inspect(engine).get_table_names())
-    assert upgrade_schema(engine) == '0002'
+        assert session.execute(text('SELECT version FROM bia_schema_versions ORDER BY version')).scalars().all() == ['0001', '0002', '0003']
+    assert {'dataset_snapshots', 'institute_assessments', 'document_governance'}.issubset(inspect(engine).get_table_names())
+    assert upgrade_schema(engine) == '0003'
 
 
 def test_schema_requires_explicit_upgrade_and_rejects_partial(tmp_path):

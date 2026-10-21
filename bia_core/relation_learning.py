@@ -89,7 +89,7 @@ def reviewed_relations(session: Session) -> list[dict]:
         select(ScientificRelation, Passage, Document)
         .join(Passage, ScientificRelation.passage_id == Passage.id)
         .join(Document, Passage.document_id == Document.id)
-        .where(Document.training_allowed.is_(True), ScientificRelation.status.in_(("approved", "rejected")))
+        .where(Document.training_allowed.is_(True), Document.status != "restricted", ScientificRelation.status.in_(("approved", "rejected")))
         .order_by(Document.sha256, Passage.page, ScientificRelation.id)
     ).all()
     rows: list[dict] = []

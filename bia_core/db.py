@@ -239,3 +239,16 @@ class InstituteAssessment(Base):
     actor: Mapped[str] = mapped_column(String(128), nullable=False)
     label: Mapped[str] = mapped_column(String(32), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, nullable=False)
+
+
+class DocumentGovernance(Base):
+    """Controle de acesso e retenção; não autoriza exclusão de evidências."""
+    __tablename__ = "document_governance"
+    document_id: Mapped[str] = mapped_column(ForeignKey("documents.id"), primary_key=True)
+    access_status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    original_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    retention_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    legal_hold: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    reason: Mapped[str] = mapped_column(String(500), nullable=False)
+    updated_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=now)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone, timedelta
 from hashlib import sha256
 import json
 import os
@@ -28,8 +29,10 @@ from bia_core.relation_learning import train_relations, predict_candidates
 from bia_core.evaluation import verified_report
 from bia_core.adjudication import validate_alternative, has_overlap, unresolved_count, dispute_record
 from bia_core.bibliography import normalize_doi, signals, ordered_pair, publication_clusters
-from bia_core.db import AnnotationDispute, BibliographicDecision, AgreementTask, AgreementVote, AgreementResolution, DatasetSnapshot, InstituteAssessment
+from bia_core.db import AnnotationDispute, BibliographicDecision, AgreementTask, AgreementVote, AgreementResolution, DatasetSnapshot, InstituteAssessment, DocumentGovernance
 from bia_core.institutional import INSTITUTES, create_snapshot, current_snapshot, institute_report
+from bia_core.transitions import submit_once, certify_once, reopen_once
+from bia_core.governance import governance_report, governance_payload, set_governance, corpus_manifest
 from bia_core.agreement import AGREEMENT_LABELS, agreement_report, task_state, votes_for, gold_snapshot, passage_agreement_ready
 
 ROLES = ("viewer", "researcher", "curator", "admin")
@@ -109,6 +112,14 @@ class InstituteEvaluation(BaseModel):
     label: Literal["MATERIAL", "PROCESS", "PROPERTY", "QUANTITY", "UNIT", "CONDITION", "APPLICATION", "NONE"]
 
 
+class GovernanceDecision(BaseModel):
+    access_status: Literal["active", "restricted"]
+    retention_until: datetime | None = None
+    legal_hold: bool = False
+    release_hold: bool = False
+    reason: str = Field(min_length=10, max_length=500)
+
+
 class TrainRequest(BaseModel):
     epochs: int = Field(default=2, ge=1, le=25)
     seed: int = Field(default=42, ge=0, le=2**31 - 1)
@@ -126,7 +137,7 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
     job_lock = Lock()
     app = FastAPI(title="bIA Scientific Core", version="0.1.0", docs_url="/docs")
     origins = os.getenv("BIA_CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
-    app.add_middleware(CORSMiddleware, allow_origins=[o for o in origins if o], allow_methods=["GET", "POST"], allow_headers=["Authorization", "Content-Type"])
+    app.add_middleware(CORSMiddleware, allow_origins=[o for o in origins if o], allow_methods=["GET", "POST", "PUT"], allow_headers=["Authorization", "Content-Type"])
 
     def db():
         with session_factory() as session:
@@ -153,6 +164,8 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
         return require
 
     def visible(doc: Document, user: dict) -> bool:
+        if doc.status == "restricted":
+            return user["role"] == "admin"
         return doc.rights_basis != "institutional_permission" or user["role"] in ("curator", "admin")
 
     def audit(session, user, action, resource):
@@ -171,6 +184,11 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
         except IntegrityError as exc:
             session.rollback()
             raise HTTPException(409, message) from exc
+
+    def lock_passage(session, passage_id):
+        # PostgreSQL: lock the passage before edits, submit, certify or reopen.
+        if session.get_bind().dialect.name == "postgresql":
+            session.scalar(select(Passage).where(Passage.id == passage_id).with_for_update())
 
     def get_doc(session, doc_id, user):
         doc = session.get(Document, doc_id)
@@ -224,6 +242,50 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
         session.commit()
         return {"id": document.id, "sha256": digest, "status": document.status, "pages": len(pages)}
 
+    @app.put("/v1/documents/{document_id}/governance")
+    def update_document_governance(document_id: str, data: GovernanceDecision,
+                                   user: dict = Depends(role("admin",)), session: Session = Depends(db)):
+        doc = session.get(Document, document_id)
+        if doc is None:
+            raise HTTPException(404, "Documento não encontrado")
+        if data.retention_until is not None and data.retention_until.tzinfo is None:
+            raise HTTPException(422, "Prazo de retenção precisa incluir fuso horário")
+        # PostgreSQL serializa decisões concorrentes sobre o mesmo documento.
+        if session.get_bind().dialect.name == "postgresql":
+            session.execute(select(Document).where(Document.id == document_id).with_for_update()).scalar_one()
+            session.refresh(doc)
+        previous = session.get(DocumentGovernance, document_id)
+        if previous is not None and previous.legal_hold and not data.legal_hold and not data.release_hold:
+            raise HTTPException(409, "Suspensão da guarda exige liberação explícita")
+        if data.release_hold and (previous is None or not previous.legal_hold or data.legal_hold):
+            raise HTTPException(409, "Liberação de guarda inconsistente")
+        try:
+            record = set_governance(session, doc, actor=user["actor"], status=data.access_status,
+                                    retention_until=data.retention_until, legal_hold=data.legal_hold, reason=data.reason)
+        except IntegrityError as exc:
+            session.rollback()
+            raise HTTPException(409, "Governança atualizada em outra transação") from exc
+        audit(session, user, "document.governance.update", document_id)
+        session.commit()
+        return governance_payload(doc, record)
+
+    @app.get("/v1/documents/{document_id}/governance")
+    def get_document_governance(document_id: str, user: dict = Depends(role("admin",)),
+                                session: Session = Depends(db)):
+        doc = session.get(Document, document_id)
+        if doc is None:
+            raise HTTPException(404, "Documento não encontrado")
+        return governance_payload(doc, session.get(DocumentGovernance, document_id))
+
+    @app.get("/v1/corpus/readiness")
+    def corpus_readiness(user: dict = Depends(role("admin",)), session: Session = Depends(db)):
+        return governance_report(session)
+
+    @app.get("/v1/corpus/manifest")
+    def corpus_documents(offset: int = Query(default=0, ge=0), limit: int = Query(default=100, ge=1, le=100),
+                         user: dict = Depends(role("admin",)), session: Session = Depends(db)):
+        return corpus_manifest(session, offset=offset, limit=limit)
+
     @app.get("/v1/documents/{document_id}")
     def document_details(document_id: str, user: dict = Depends(role(*ROLES)), session: Session = Depends(db)):
         doc = get_doc(session, document_id, user)
@@ -258,6 +320,8 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
         passage = session.get(Passage, data.passage_id)
         if passage is None:
             raise HTTPException(404, "Trecho não encontrado")
+        get_doc(session, passage.document_id, user)
+        lock_passage(session, passage.id)
         if not passage.text[data.start:data.end] or data.end > len(passage.text):
             raise HTTPException(422, "Offsets excedem texto original")
         state = review_state(session, passage.id)
@@ -291,6 +355,7 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
             raise HTTPException(404, "Anotação não encontrada")
         passage = session.get(Passage, annotation.passage_id)
         get_doc(session, passage.document_id, user)
+        lock_passage(session, passage.id)
         if review_state(session, annotation.passage_id)["status"] != "draft":
             raise HTTPException(409, "Trecho submetido ou certificado; reabra antes de modificar")
         if annotation.status != "pending":
@@ -345,21 +410,14 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
         if passage is None:
             raise HTTPException(404, "Trecho não encontrado")
         get_doc(session, passage.document_id, user)
+        lock_passage(session, passage.id)
         state = review_state(session, passage_id)
         if state["status"] != "draft":
             raise HTTPException(409, "Trecho já submetido ou certificado")
         if state["pending_annotations"] or state["unresolved_disputes"]:
             raise HTTPException(409, "Resolva anotações pendentes e divergências antes de submeter")
-        review = session.get(PassageReview, passage_id)
-        if review is None:
-            review = PassageReview(passage_id=passage_id, submitted_by=user["actor"])
-            session.add(review)
-        else:
-            review.status = "submitted"
-            review.submitted_by = user["actor"]
-            review.submitted_at = now()
-            review.certified_by = None
-            review.certified_at = None
+        if not submit_once(session, passage_id, user["actor"]):
+            raise HTTPException(409, "Trecho alterado em transação concorrente")
         audit(session, user, "passage.review.submit", passage_id)
         session.commit()
         return review_state(session, passage_id)
@@ -370,6 +428,7 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
         if passage is None:
             raise HTTPException(404, "Trecho não encontrado")
         get_doc(session, passage.document_id, user)
+        lock_passage(session, passage.id)
         review = session.get(PassageReview, passage_id)
         if review is None or review.status != "submitted":
             raise HTTPException(409, "Trecho ainda não foi submetido")
@@ -378,9 +437,8 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
         state = review_state(session, passage_id)
         if state["pending_annotations"] or state["unresolved_disputes"]:
             raise HTTPException(409, "Existem anotações ou divergências pendentes")
-        review.status = "certified"
-        review.certified_by = user["actor"]
-        review.certified_at = now()
+        if not certify_once(session, passage_id, user["actor"]):
+            raise HTTPException(409, "Certificação alterada em transação concorrente")
         audit(session, user, "passage.review.certify", passage_id)
         session.commit()
         return review_state(session, passage_id)
@@ -391,12 +449,12 @@ def make_app(*, db_url: str | None = None, storage_dir: Path | None = None, keys
         if passage is None:
             raise HTTPException(404, "Trecho não encontrado")
         get_doc(session, passage.document_id, user)
+        lock_passage(session, passage.id)
         review = session.get(PassageReview, passage_id)
         if review is None or review.status == "draft":
             raise HTTPException(409, "Trecho já está em rascunho")
-        review.status = "draft"
-        review.certified_by = None
-        review.certified_at = None
+        if not reopen_once(session, passage_id):
+            raise HTTPException(409, "Trecho alterado em transação concorrente")
         audit(session, user, "passage.review.reopen", passage_id)
         session.commit()
         return review_state(session, passage_id)

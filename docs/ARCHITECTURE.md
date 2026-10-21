@@ -66,3 +66,8 @@ A adjudicação preserva as alternativas de duas identidades, exige uma terceira
 - `InstituteAssessment` registra observação independente por instituto, tarefa e versão da certificação. Não influencia o gold nem o treinamento; relatórios por instituto usam somente trechos com certificação vigente.
 - Restrições UNIQUE e `IntegrityError` tratado para operações críticas de concordância e bibliografia; alta concorrência de todos os estados e PostgreSQL distribuído continuam pendentes para produção.
 - Detalhes, interfaces, riscos e próximos testes: [BIA-02.6](BLOCO_02_6_INFRAESTRUTURA.md).
+
+
+## Extensão BIA-02.7
+
+A migração `0003` instala `document_governance`: restrição de acesso e treinamento, prazo de revisão da retenção e guarda legal sem exclusões automáticas. Transições de submissão/certificação/reabertura usam operações SQL condicionais; PostgreSQL usa lock de linha do trecho nas mutações de curadoria. O CI possui testes transacionais com serviço PostgreSQL 16 e processos distintos. Inventário de prontidão é **somente administrativo**, sem conteúdo de PDFs. Ver [BLOCO_02_7_TRANSACOES_RETENCAO.md](BLOCO_02_7_TRANSACOES_RETENCAO.md).

@@ -14,10 +14,14 @@ type Dispute = { id: string; status: string; first: DisputeAlternative; second: 
 type Duplicate = { document_id: string; title: string; doi: string | null; year: number | null; signals: string[]; verdict: string; reviewed_by: string | null };
 type AgreementTask = { id: string; passage_id: string; quote: string; start: number; end: number; raters: string[]; complete: boolean; votes_received: number; needs_adjudication: boolean; adjudicated: boolean; votes?: { a: string; b: string }; final_label?: string | null };
 type AgreementMetric = { rater_a: string; rater_b: string; tasks: number; complete: number; agreement_rate: number | null; cohen_kappa: number | null; kappa_defined: boolean };
+type CorpusRecord = { id: string; title: string; rights_basis: string; status: string; training_allowed: boolean; certified_passages: number; readiness_issues: string[] };
+type CorpusOverview = { documents: number; restricted_documents: number; training_authorized_ready_documents: number; training_authorized_certified_passages: number; legal_holds: number; retention_review_due: number; scientifically_validated: boolean };
 type VerifiedRelation = { id: string; title: string; doi: string | null; page: number; relation_type: string; subject: { quote: string }; object: { quote: string }; evidence: { quote: string }; review: { proposed_by: string; reviewed_by: string } };
 
 export default function Research() {
   const [token, setToken] = useState('');
+  const [corpusOverview, setCorpusOverview] = useState<CorpusOverview | null>(null);
+  const [corpusRecords, setCorpusRecords] = useState<CorpusRecord[]>([]);
   const [query, setQuery] = useState('lignocelulose');
   const [hits, setHits] = useState<Hit[]>([]);
   const [passages, setPassages] = useState<Passage[]>([]);
@@ -63,6 +67,14 @@ export default function Research() {
   async function exec(fn: () => Promise<void>) {
     setMessage('');
     try { await fn(); } catch (e) { setMessage((e as Error).message); }
+  }
+  async function loadCorpus() {
+    await exec(async () => {
+      setCorpusOverview(await api('/v1/corpus/readiness'));
+      const manifest = await api('/v1/corpus/manifest?offset=0&limit=100');
+      setCorpusRecords(manifest.items);
+      setMessage('Inventário interno recuperado. Os dados ainda exigem validação científica.');
+    });
   }
   async function search(e: FormEvent) {
     e.preventDefault();
@@ -277,6 +289,16 @@ export default function Research() {
   return <main>
     <header><span className="badge">Bloco 02.5 · Concordância científica e datasets auditáveis</span><h1>bIA</h1><p className="muted">Inteligência de materiais com fontes verificáveis · modelo próprio · processamento local</p></header>
     <section className="card stack"><h2>Conexão com o laboratório</h2><label>Token de acesso (somente memória desta aba)</label><input type="password" value={token} autoComplete="off" onChange={e => setToken(e.target.value)} placeholder="Bearer token configurado na API" /><small>Use tokens diferentes para criar e revisar anotações. Não utilize este protótipo publicamente sem autenticação institucional.</small></section>
+    <section className="card stack"><h2>Inventário científico e governança · BIA-02.7</h2>
+      <p className="muted">Visão administrativa restrita: fontes, autorização de treinamento e revisão de retenção. Não é uma certificação científica nem autoriza exclusões automáticas.</p>
+      <button type="button" disabled={!token} onClick={loadCorpus}>Consultar inventário autorizado</button>
+      {corpusOverview && <p>Documentos: {corpusOverview.documents} · elegíveis para treino: {corpusOverview.training_authorized_ready_documents} · trechos certificados autorizados: {corpusOverview.training_authorized_certified_passages} · acesso restrito: {corpusOverview.restricted_documents} · guarda legal: {corpusOverview.legal_holds} · retenções a revisar: {corpusOverview.retention_review_due}</p>}
+      {corpusRecords.map(doc => <article className="result" key={doc.id}><strong>{doc.title}</strong>
+        <p className="muted">{doc.status} · {doc.rights_basis} · trechos certificados: {doc.certified_passages} · treinamento: {doc.training_allowed ? 'autorizado' : 'não autorizado'}</p>
+        {doc.readiness_issues.length > 0 && <small>Pendências: {doc.readiness_issues.join(', ')}</small>}
+      </article>)}
+      {corpusOverview && <small>São exibidos até 100 documentos por consulta. Revogação de direitos e guarda legal somente pela API administrativa autenticada.</small>}
+    </section>
     <section className="card"><h2>Importar documento científico autorizado</h2><form className="stack" onSubmit={upload}>
       <input required placeholder="Título do trabalho" value={title} onChange={e => setTitle(e.target.value)} />
       <select value={rights} onChange={e => setRights(e.target.value)}><option value="open_access">Acesso aberto (com direitos verificados)</option><option value="author_permission">Permissão do autor</option><option value="institutional_permission">Permissão institucional (acesso restrito)</option></select>

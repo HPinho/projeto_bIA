@@ -144,3 +144,14 @@ O protótipo passou a usar revisões de banco `0001` e `0002` em `bia_core/schem
 - Restrições únicas do banco e respostas HTTP 409 protegem votos e adjudicações duplicados em concorrência. Os snapshots têm triggers que bloqueiam UPDATE/DELETE no próprio banco.
 
 **Limitações:** PostgreSQL em múltiplos processos, direitos de retenção e todas as transições concorrentes de curadoria exigem homologação adicional. Avaliação com dados sintéticos não comprova precisão científica. Veja [o protocolo completo BIA-02.6](docs/BLOCO_02_6_INFRAESTRUTURA.md). **Próximo item: BIA-02.7 — endurecimento transacional PostgreSQL e validação tripartite com corpus real autorizado.**
+
+
+## BIA-02.7 — governança, concorrência PostgreSQL e prontidão do corpus
+
+A revisão `0003` adiciona governança documental com restrição imediata de acesso/treinamento, guarda legal e prazos para **revisão** humana (nenhuma exclusão física automática). A certificação usa mudanças condicionais de estado, com lock PostgreSQL nas rotas de curadoria; chamadas obsoletas retornam HTTP 409.
+
+Administradores podem consultar `/v1/corpus/readiness` (contagens agregadas), `/v1/corpus/manifest` (metadados e pendências) e gerenciar `/v1/documents/{id}/governance`. A interface apresenta o inventário autorizado sem abrir textos completos. Restrições de documentos bloqueiam novos treinamentos e a exposição de snapshots antigos, mas não removem pesos já treinados.
+
+O GitHub Actions executa também um job real **PostgreSQL 16** com duas requisições concorrentes em processos separados. Use `pip install -e '.[test,postgres]'` para esse teste e `BIA_TEST_POSTGRES_URL` para apontar um banco descartável. Sem essa variável, os testes PostgreSQL são pulados localmente.
+
+Detalhes, limites e instruções de migração: [docs/BLOCO_02_7_TRANSACOES_RETENCAO.md](docs/BLOCO_02_7_TRANSACOES_RETENCAO.md). Próximo item **BIA-02.8 — isolamento institucional, autenticação e corpus validado**.
